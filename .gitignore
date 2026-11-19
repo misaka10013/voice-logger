@@ -50,6 +50,9 @@ _v[0-9]*.png
 keystore.properties
 .env
 
+# 提交前扫描用的敏感词表：词表本身就是敏感信息，绝不入库
+.privcheck-words
+
 # 一次性声学实验（脚本可复现，产物不入库）
 _exp/
 *.m4a

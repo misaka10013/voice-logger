@@ -1,0 +1,131 @@
+name: Build APK
+
+# 触发方式：
+#   · push 到 main        → 出 APK，挂在本次运行的 artifact 里
+#   · push 一个 v* 标签    → 额外创建 Release，APK 可直接在手机上点下载
+#   · 手动触发            → 同上，只出 artifact
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # sherpa-onnx.aar（47MB）被 .gitignore 排除，CI 需自取。
+      # 缓存命中时跳过下载，冷启动约 10 秒。
+      - name: 缓存 sherpa-onnx AAR
+        id: aar
+        uses: actions/cache@v4
+        with:
+          path: app/libs/sherpa-onnx.aar
+          key: sherpa-onnx-aar-2.0.1
+
+      - name: 下载 sherpa-onnx AAR
+        if: steps.aar.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p app/libs
+          curl -fL --retry 3 --retry-delay 3 \
+            -o app/libs/sherpa-onnx.aar \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-2.0.1.aar
+          ls -lh app/libs/sherpa-onnx.aar
+
+      # 手机上已装的版本是用本机 ~/.android/debug.keystore 签的。
+      # CI runner 自带的是另一把随机调试密钥，直接装会报签名冲突、必须先卸载（丢数据）。
+      # 所以把本机那把密钥存进 secret，在这里还原，保证 CI 产物能直接覆盖安装。
+      - name: 还原固定调试签名
+        env:
+          KS_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+          EXPECT_SHA256: ${{ secrets.DEBUG_KEYSTORE_SHA256 }}
+        run: |
+          mkdir -p ~/.android
+          if [ -n "${KS_B64:-}" ]; then
+            printf '%s' "$KS_B64" | base64 -d > ~/.android/debug.keystore
+            echo "已还原固定调试签名（可覆盖安装手机上已有版本）"
+          else
+            echo "::warning::未配置 DEBUG_KEYSTORE_B64 —— 本次 APK 签名与手机已有版本不同，安装前必须先卸载（会丢本地数据）"
+          fi
+
+      # 本地为了让国内下载快，wrapper 用的是腾讯镜像；runner 在海外，走官方源更快更稳。
+      # 只改工作区，不提交，本地配置不受影响。
+      - name: 切换 Gradle 下载源
+        run: |
+          sed -i 's#https://mirrors.cloud.tencent.com/gradle/#https://services.gradle.org/distributions/#' \
+            gradle/wrapper/gradle-wrapper.properties
+          grep distributionUrl gradle/wrapper/gradle-wrapper.properties
+
+      - name: 构建 Debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --console=plain
+
+      - name: 检查产物
+        env:
+          EXPECT_SHA256: ${{ secrets.DEBUG_KEYSTORE_SHA256 }}
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          ls -lh "$APK"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
+          GOT=$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null \
+                | sed -n 's/.*SHA-256 digest: //p' | head -1 | tr -d ':' | tr 'A-F' 'a-f')
+          echo "APK 签名 SHA-256: $GOT"
+          if [ -n "${EXPECT_SHA256:-}" ]; then
+            WANT=$(printf '%s' "$EXPECT_SHA256" | tr -d ':' | tr 'A-F' 'a-f')
+            if [ "$GOT" != "$WANT" ]; then
+              echo "::error::签名指纹与手机已装版本不一致，无法覆盖安装"
+              exit 1
+            fi
+            echo "签名指纹与手机已装版本一致，可直接覆盖安装"
+          fi
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-logger-debug-${{ github.sha }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: 重命名（Release 用）
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             "voice-logger-${GITHUB_REF_NAME}.apk"
+
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: voice-logger-${{ github.ref_name }}.apk
+          generate_release_notes: true
+          body: |
+            Debug 签名的安装包，可直接覆盖安装到已装同款 App 的手机上。
+
+            ⚠️ 首次安装后仍需按 README「四、安装与部署模型」把 230MB 模型推进设备，
+            否则转写不可用（App 会提示缺模型）。

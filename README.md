@@ -65,6 +65,36 @@ cd voice-logger
 ```
 
 依赖的 sherpa-onnx 预编译库在 `app/libs/sherpa-onnx.aar`（官方 v2.0.1，含 arm64-v8a）。
+它体积 47MB，**不入库**，首次构建前需自行下载：
+
+```bash
+mkdir -p app/libs
+curl -fL -o app/libs/sherpa-onnx.aar \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-2.0.1.aar
+```
+
+（`app/build.gradle.kts` 用的是 `implementation(files("libs/sherpa-onnx.aar"))`，
+文件缺失时构建会直接失败。）
+
+---
+
+## 三之二、提交前检查（可选但建议）
+
+这个工程处理的是「家里的说话声」，真实对话一旦进了提交历史，删文件也救不回来
+（`git log -p` 仍能查到）。仓库带了一套本地检查：
+
+```bash
+git config core.hooksPath .githooks
+cp .privcheck-words.example .privcheck-words   # 再按需填入你自己的敏感词
+```
+
+启用后每次 `git commit` 会拦下四类问题：不该入库的路径/扩展名（录音、数据库、
+模型、密钥）、单文件超 20MB、命中 `.privcheck-words` 的词、疑似明文密钥。
+
+词表刻意做成**不入库的本地文件**——把真实姓名写进公开的检查脚本，等于换了个
+地方泄露。缺这个词表时脚本跳过词匹配，其余检查照常。
+
+确属误报：`git commit --no-verify`。
 
 ---
 
@@ -238,7 +268,37 @@ ESP32-S3 只能做 VAD + 录音 + 上传，跑不了中文 ASR。
 
 ---
 
-## 十二、许可
+## 十二、自动构建
+
+`.github/workflows/android.yml` 在 GitHub Actions 上出包，两条路径：
+
+| 触发 | 产物 | 用途 |
+|---|---|---|
+| push 到 `main` | 本次运行的 artifact（保留 30 天） | 每次改动都能拿到一个可装包 |
+| push 一个 `v*` 标签 | 额外创建 Release，附件 `voice-logger-vX.Y.Z.apk` | 手机浏览器直接点下载 |
+
+手动触发也行（Actions → Build APK → Run workflow）。
+
+**关于签名**：CI runner 默认生成的是随机调试密钥，用它出的包**装不上**已装的版本
+（签名冲突，必须先卸载，本地数据库会一起丢）。所以 workflow 会从
+`DEBUG_KEYSTORE_B64` 这个 secret 还原固定密钥，再校验产物指纹与
+`DEBUG_KEYSTORE_SHA256` 是否一致——不一致直接失败，不让一个装不上的包流出去。
+
+自建仓库时要配这两个 secret（Settings → Secrets and variables → Actions）：
+
+```bash
+# 取当前已装版本的签名指纹
+apksigner verify --print-certs app/build/outputs/apk/debug/app-debug.apk | grep 'SHA-256'
+# 生成 base64（Linux/macOS）
+base64 -w0 ~/.android/debug.keystore      # macOS 用 base64 -i
+```
+
+Windows 上取 base64：`certutil -encodehex -f "%USERPROFILE%\.android\debug.keystore" ks.txt 4`
+然后去掉首尾标记行。不配这两个 secret 也能构建，只是包不能覆盖安装。
+
+---
+
+## 十三、许可
 
 代码采用 [MIT License](LICENSE)。
 

@@ -1,0 +1,31 @@
+#!/bin/sh
+# ============================================================================
+# 提交信息检查
+# ----------------------------------------------------------------------------
+# 提交信息会永久留在历史里，且公开可见。敏感词表与 pre-commit 共用
+# 仓库根目录的 .privcheck-words（不入库）。
+# ============================================================================
+set -u
+
+MSG_FILE="$1"
+TOP=$(git rev-parse --show-toplevel)
+WORDLIST="$TOP/.privcheck-words"
+
+[ -f "$MSG_FILE" ] || exit 0
+[ -f "$WORDLIST" ] || exit 0
+
+fail=0
+while IFS= read -r w; do
+  case "$w" in ''|'#'*) continue ;; esac
+  if grep -qF -- "$w" "$MSG_FILE" 2>/dev/null; then
+    [ "$fail" -eq 0 ] && printf '✗ 提交信息命中敏感词，请改写后再提交：\n'
+    printf '    命中：%s\n' "$w"
+    fail=1
+  fi
+done < "$WORDLIST"
+
+if [ "$fail" -ne 0 ]; then
+  printf '  提交信息会永久公开，改用中性表述（如「说话人A」）\n'
+  exit 1
+fi
+exit 0

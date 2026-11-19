@@ -1,0 +1,106 @@
+#!/bin/sh
+# ============================================================================
+# voice-logger 提交前检查
+# ----------------------------------------------------------------------------
+# 这个项目处理的是「家里的说话声」，隐私是持续风险而不是一次性任务。
+# 一旦真实对话/录音/密钥进了提交历史，删文件没用 —— git log -p 仍能查到。
+#
+# 检查四类：
+#   1. 不该入库的路径与扩展名（录音、数据库、模型、密钥、本机配置）
+#   2. 单个文件体积
+#   3. 敏感词（真实姓名、云端环境 ID 等）
+#   4. 疑似明文密钥/令牌
+#
+# 敏感词表放在仓库根目录的 .privcheck-words（已被 .gitignore 排除，不入库）：
+#   每行一个词，# 开头为注释。
+#   词表外置是必须的 —— 把真实姓名写进这个脚本，等于把姓名开源。
+#   没有这个词表时，前 3、4 类检查照常执行，敏感词扫描会跳过并提示。
+#
+# 启用：git config core.hooksPath .githooks   （README「开发」一节有说明）
+# 临时跳过：git commit --no-verify
+# ============================================================================
+set -u
+
+fail=0
+TOP=$(git rev-parse --show-toplevel)
+cd "$TOP" || exit 1
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$STAGED" ] && exit 0
+
+hr() { printf '%s\n' "--------------------------------------------------------------"; }
+
+# ---------------------------------------------------------------- 1. 路径与扩展名
+BAD=$(printf '%s\n' "$STAGED" | grep -iE \
+  '\.(db|db-wal|db-shm|sqlite|wav|m4a|mp3|amr|opus|flac|onnx|tflite|pt|lite|jks|keystore|apk|aab)$' \
+  || true)
+BADPATH=$(printf '%s\n' "$STAGED" | grep -iE \
+  '(^|/)(models|\.dbg|_backup|_exp|_shot)/|(^|/)local\.properties$|(^|/)\.env$|(^|/)keystore\.properties$|(^|/)\.privcheck-words$' \
+  || true)
+
+if [ -n "$BAD$BADPATH" ]; then
+  hr
+  printf '✗ 这些文件不该入库（真实录音 / 数据库 / 模型 / 密钥 / 本机配置）：\n'
+  printf '%s\n%s\n' "$BAD" "$BADPATH" | grep -v '^$' | sort -u | sed 's/^/    /'
+  printf '  处理：git restore --staged <文件>  并确认 .gitignore 已覆盖\n'
+  fail=1
+fi
+
+# ---------------------------------------------------------------- 2. 文件体积
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  [ -f "$f" ] || continue
+  sz=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+  if [ "$sz" -gt 20971520 ]; then
+    hr
+    printf '✗ 体积超过 20MB：%s（%s MB）\n' "$f" "$((sz / 1048576))"
+    printf '  大文件应走 Release 或外部下载，不放仓库\n'
+    fail=1
+  elif [ "$sz" -gt 5242880 ]; then
+    printf '⚠ 体积 %sMB：%s（请确认是必要的）\n' "$((sz / 1048576))" "$f"
+  fi
+done <<EOF
+$STAGED
+EOF
+
+# ---------------------------------------------------------------- 3. 敏感词
+WORDLIST="$TOP/.privcheck-words"
+if [ -f "$WORDLIST" ]; then
+  HITANY=0
+  while IFS= read -r w; do
+    case "$w" in ''|'#'*) continue ;; esac
+    hits=$(printf '%s\n' "$STAGED" | while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      grep -IHn -F -- "$w" "$f" 2>/dev/null | head -3
+    done)
+    if [ -n "$hits" ]; then
+      [ "$HITANY" -eq 0 ] && { hr; printf '✗ 命中敏感词：\n'; HITANY=1; }
+      printf '  词「%s」\n' "$w"
+      printf '%s\n' "$hits" | sort -u | sed 's/^/      /'
+      fail=1
+    fi
+  done < "$WORDLIST"
+else
+  printf '⚠ 未找到 .privcheck-words，本次跳过敏感词扫描（结构性检查已执行）\n'
+fi
+
+# ---------------------------------------------------------------- 4. 疑似明文密钥
+SECRETS=$(printf '%s\n' "$STAGED" | while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  grep -IHnE '(api[_-]?key|apikey|access[_-]?token|secret[_-]?key|client[_-]?secret|password)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_+/=-]{16,}' "$f" 2>/dev/null | head -3
+done)
+if [ -n "$SECRETS" ]; then
+  hr
+  printf '✗ 疑似明文密钥 / 令牌：\n'
+  printf '%s\n' "$SECRETS" | sed 's/^/    /'
+  printf '  密钥应走环境变量或数据库，不写在源码里\n'
+  fail=1
+fi
+
+# ---------------------------------------------------------------- 结果
+if [ "$fail" -ne 0 ]; then
+  hr
+  printf '提交已拦截。确属误报时可用：git commit --no-verify\n'
+  exit 1
+fi
+exit 0
