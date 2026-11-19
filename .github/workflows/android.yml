@@ -91,19 +91,22 @@ jobs:
             gradle/wrapper/gradle-wrapper.properties
           grep distributionUrl gradle/wrapper/gradle-wrapper.properties
 
-      # 临时诊断：确认各仓库能否取到 KSP 插件标记（定位完可删）
-      - name: 诊断插件仓库可达性
+      # 临时诊断：让 Gradle 自己说它在找什么（定位完可删）
+      - name: 诊断 Gradle 解析
         run: |
-          V=2.0.21-1.0.28
-          P=com/google/devtools/ksp/com.google.devtools.ksp.gradle.plugin/$V
-          for u in \
-            "https://repo1.maven.org/maven2/$P/com.google.devtools.ksp.gradle.plugin-$V.pom" \
-            "https://repo.maven.apache.org/maven2/$P/com.google.devtools.ksp.gradle.plugin-$V.pom" \
-            "https://plugins.gradle.org/m2/$P/com.google.devtools.ksp.gradle.plugin-$V.pom" \
-            "https://dl.google.com/dl/android/maven2/$P/com.google.devtools.ksp.gradle.plugin-$V.pom" ; do
-            printf '%s\n  -> ' "$u"
-            curl -sL -o /dev/null -w '%{http_code} (%{time_total}s)\n' --max-time 25 "$u" || echo "curl 失败"
-          done
+          echo "===== ~/.gradle 内容 ====="
+          ls -la ~/.gradle/ 2>/dev/null || echo "(无)"
+          echo "===== init.d 脚本 ====="
+          ls -la ~/.gradle/init.d/ 2>/dev/null && cat ~/.gradle/init.d/*.gradle* 2>/dev/null | head -40 || echo "(无 init 脚本)"
+          echo "===== ~/.gradle/gradle.properties ====="
+          cat ~/.gradle/gradle.properties 2>/dev/null || echo "(无)"
+          echo "===== GRADLE 相关环境变量 ====="
+          env | grep -i gradle || echo "(无)"
+          echo "===== Gradle 解析输出 ====="
+          chmod +x gradlew
+          ./gradlew help --info --console=plain 2>&1 \
+            | grep -iE "ksp|repo1|repo\.maven|plugins\.gradle|dl\.google|Could not|404|Resource missing" \
+            | head -50 || true
 
       - name: 构建 Debug APK
         run: |
