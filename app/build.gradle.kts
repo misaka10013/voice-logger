@@ -5,6 +5,8 @@
 // 编译环境：SDK 35（本机已装最高版本），可正常运行在 API 36 上
 // ============================================================================
 
+import java.io.File
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -27,6 +29,24 @@ android {
         // 去掉 armeabi-v7a/x86/x86_64 可显著缩小 APK 体积
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    /* CI 上用环境变量显式指定调试签名。
+       原因：AGP 查找默认 debug keystore 的目录会受 ANDROID_SDK_HOME / ANDROID_USER_HOME
+       影响，本地是 ~/.android，而 CI runner 上这两个变量存在，AGP 会去别处找，
+       找不到就**自己生成一把随机密钥** —— 这样出的 APK 与手机已装版本签名不一致，
+       必须先卸载才能装（本地数据库会一起丢）。
+       本地不设 DEBUG_KEYSTORE 时这段不生效，行为与原来完全一致。 */
+    signingConfigs {
+        getByName("debug") {
+            val ksPath = System.getenv("DEBUG_KEYSTORE")
+            if (!ksPath.isNullOrBlank() && File(ksPath).exists()) {
+                storeFile = File(ksPath)
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
         }
     }
 

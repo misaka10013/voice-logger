@@ -73,12 +73,17 @@ jobs:
       - name: 还原固定调试签名
         env:
           KS_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
-          EXPECT_SHA256: ${{ secrets.DEBUG_KEYSTORE_SHA256 }}
         run: |
-          mkdir -p ~/.android
+          # 写到工作区的固定路径，构建时用 DEBUG_KEYSTORE 环境变量明确指过去，
+          # 不依赖 AGP 对 $HOME/.android 的查找（runner 上可能被 ANDROID_SDK_HOME 改写）。
+          mkdir -p "$GITHUB_WORKSPACE/.keystore" ~/.android
           if [ -n "${KS_B64:-}" ]; then
-            printf '%s' "$KS_B64" | base64 -d > ~/.android/debug.keystore
-            echo "已还原固定调试签名（可覆盖安装手机上已有版本）"
+            printf '%s' "$KS_B64" | base64 -d > "$GITHUB_WORKSPACE/.keystore/debug.keystore"
+            cp "$GITHUB_WORKSPACE/.keystore/debug.keystore" ~/.android/debug.keystore
+            echo "已还原固定调试签名"
+            echo "md5: $(md5sum "$GITHUB_WORKSPACE/.keystore/debug.keystore" | cut -d' ' -f1)  大小: $(stat -c%s "$GITHUB_WORKSPACE/.keystore/debug.keystore") 字节"
+            echo "--- runner 上 Android 目录相关环境变量 ---"
+            env | grep -iE "^ANDROID_" || echo "(无)"
           else
             echo "::warning::未配置 DEBUG_KEYSTORE_B64 —— 本次 APK 签名与手机已有版本不同，安装前必须先卸载（会丢本地数据）"
           fi
@@ -91,24 +96,20 @@ jobs:
             gradle/wrapper/gradle-wrapper.properties
           grep distributionUrl gradle/wrapper/gradle-wrapper.properties
 
-      # 临时诊断：让 Gradle 自己说它在找什么（定位完可删）
-      - name: 诊断 Gradle 解析
+      # 预热：先单独解析一次插件。
+      # 冷启动首次执行 assembleDebug 时，Gradle 解析插件标记偶发失败
+      # （先请求 google() 得 404、再请求 Maven Central 时若遇瞬时错误，
+      #  Gradle 会把结果当成「仓库里没有」而直接报 plugin not found）。
+      # 单独跑一次 help 把插件拉进缓存，后面的正式构建就稳定了。
+      - name: 预热（解析构建插件）
         run: |
-          echo "===== ~/.gradle 内容 ====="
-          ls -la ~/.gradle/ 2>/dev/null || echo "(无)"
-          echo "===== init.d 脚本 ====="
-          ls -la ~/.gradle/init.d/ 2>/dev/null && cat ~/.gradle/init.d/*.gradle* 2>/dev/null | head -40 || echo "(无 init 脚本)"
-          echo "===== ~/.gradle/gradle.properties ====="
-          cat ~/.gradle/gradle.properties 2>/dev/null || echo "(无)"
-          echo "===== GRADLE 相关环境变量 ====="
-          env | grep -i gradle || echo "(无)"
-          echo "===== Gradle 解析输出 ====="
           chmod +x gradlew
-          ./gradlew help --info --console=plain 2>&1 \
-            | grep -iE "ksp|repo1|repo\.maven|plugins\.gradle|dl\.google|Could not|404|Resource missing" \
-            | head -50 || true
+          ./gradlew help --console=plain -q
 
       - name: 构建 Debug APK
+        env:
+          # 显式指定签名文件，绕开 AGP 对默认路径的猜测（见 app/build.gradle.kts 注释）
+          DEBUG_KEYSTORE: ${{ github.workspace }}/.keystore/debug.keystore
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --console=plain
