@@ -1521,11 +1521,19 @@ fun SessionDetailScreen(
 
     // ------------------------------------------------ 批量标注 Dialog
     if (bulkSpeaker) {
+        /* 多选后常常就是想「这批机器猜的都对」，所以批量也要支持确认。
+           只在选中句名字全一致时才认 current：混杂时传空，
+           否则弹窗会写着「当前标的是 X」而选中里其实还有别的名字。 */
+        val bulkCurrent = selected
+            .mapNotNull { id -> transcripts.firstOrNull { it.id == id }?.speakerName }
+            .distinct()
+            .singleOrNull()
         SpeakerPickerDialog(
             title = "为选中的 ${selected.size} 句标记说话人",
             meName = meName,
             knownSpeakers = knownSpeakers,
             tags = tags,
+            current = bulkCurrent,
             onDismiss = { bulkSpeaker = false },
             onPick = { name ->
                 val ids = selected
@@ -1548,23 +1556,43 @@ fun SessionDetailScreen(
        比打开整个编辑弹窗少一次点击、不遮住上下文；改文字已经在行内做了，
        所以右下角这个入口唯一的职责就是「这行是谁说的」。 */
     speakerTarget?.let { target ->
+        /* 机器猜的依据：音高落在男声区间（≤160Hz）实测改判率约 3.7%，
+           偏高音区间（≥200Hz）约 41% —— 把区间说出来，用户才有判断依据，
+           否则「B?」只是个无法验证的标签。 */
+        val guessNote = if (target.effectiveAuto == TranscriptEntity.AUTO_F0_GUESS) {
+            when {
+                target.f0Hz <= 0 -> "机器猜的，没有音高数据作依据"
+                target.f0Hz <= 160 -> "机器按音高猜的 ${target.f0Hz}Hz，男声区间，通常准"
+                else -> "机器按音高猜的 ${target.f0Hz}Hz，偏高音区间，容易错"
+            }
+        } else null
         SpeakerPickerDialog(
             title = "这一句是谁说的",
             meName = meName,
             knownSpeakers = knownSpeakers,
             tags = tags,
+            current = target.speakerName,
+            guessNote = guessNote,
             onDismiss = { speakerTarget = null },
             onPick = { name ->
+                /* 确认（选了同名）时这句会立刻掉出「机器猜」筛选、
+                   从当前列表里消失 —— 不给一句提示，会像被误删。 */
+                val confirming = name != null && name == target.speakerName &&
+                    target.effectiveAuto == TranscriptEntity.AUTO_F0_GUESS
                 scope.launch {
                     withContext(Dispatchers.IO) {
                         /* 走 applySpeakerEdit：它把 speakerAuto 留作快照、只置 speakerEdited，
-                           改判率才算得出来（旧注释说的「要清 auto」已于 2026-11-16 作废） */
+                           改判率才算得出来（旧注释说的「要清 auto」已于 2026-11-16 作废）。
+                           同名时它会走「确认」分支，把机器猜转成人工确认。 */
                         db.applySpeakerEdit(listOf(target.id), name)
                         rememberName(ctx, name, meName)
                     }
                     SessionState.renameSpeaker(setOf(target.id), name)
                     refreshSpeakers()
                     speakerTarget = null
+                    if (confirming) {
+                        Toast.makeText(ctx, "已确认是「$name」说的", Toast.LENGTH_SHORT).show()
+                    }
                 }
             },
         )
@@ -2474,13 +2502,23 @@ private fun SpeakerPickerDialog(
     meName: String,
     knownSpeakers: List<String>,
     tags: List<String>,
+    /* 这行当前已标的说话人。非空时「点同一个名字」＝确认，而不是「没变化」。
+       机器猜出来的名字也写在 speakerName 上，所以不给这一层，用户就只能改判、
+       没法确认 —— 那一整批「名字?」会永远挂着问号。 */
+    current: String? = null,
+    /* 当前名字是机器猜的时，把猜的依据（音高）一并说出来：
+       不给依据的话，「A?」和「A」在用户眼里没有信息差，确认也无从判断。 */
+    guessNote: String? = null,
     onDismiss: () -> Unit,
     onPick: (String?) -> Unit,
 ) {
     var custom by remember { mutableStateOf("") }
 
-    val options = remember(meName, knownSpeakers, tags) {
-        speakerOptions(meName, tags, knownSpeakers)
+    val options = remember(meName, knownSpeakers, tags, current) {
+        val base = speakerOptions(meName, tags, knownSpeakers)
+        /* 当前名字可能不在候选里（声纹档案删了、或打的是临时名字），
+           不补进来的话用户连「确认」这个动作都点不到。 */
+        if (current != null && base.none { it == current }) listOf(current) + base else base
     }
 
     androidx.compose.material3.AlertDialog(
@@ -2489,20 +2527,38 @@ private fun SpeakerPickerDialog(
         title = { Text(title, fontSize = 15.sp, color = VlColor.Text) },
         text = {
             Column {
-                Text("点一个直接应用", fontSize = 11.sp, color = VlColor.Dim)
+                if (current != null) {
+                    Text(
+                        "当前标的是「$current」" + (guessNote?.let { "（$it）" } ?: "") +
+                            "。点同一个名字＝确认这条判断，点别的＝改判",
+                        fontSize = 11.sp,
+                        color = VlColor.Dim,
+                        lineHeight = 16.sp,
+                    )
+                } else {
+                    Text("点一个直接应用", fontSize = 11.sp, color = VlColor.Dim)
+                }
                 Spacer(Modifier.height(10.dp))
                 Row(
                     Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     options.forEach { opt ->
+                        val isCurrent = current != null && opt == current
                         FilterChip(
-                            selected = false,
+                            selected = isCurrent,
                             onClick = { onPick(opt) },
-                            label = { Text(opt, fontSize = 12.sp) },
+                            label = {
+                                Text(
+                                    if (isCurrent) "$opt · 确认" else opt,
+                                    fontSize = 12.sp,
+                                )
+                            },
                             colors = FilterChipDefaults.filterChipColors(
                                 containerColor = VlColor.SurfaceVar,
                                 labelColor = VlColor.Text,
+                                selectedContainerColor = VlColor.Accent,
+                                selectedLabelColor = VlColor.Surface,
                             ),
                         )
                     }

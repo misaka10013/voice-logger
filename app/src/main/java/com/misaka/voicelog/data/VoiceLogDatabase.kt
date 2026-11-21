@@ -134,6 +134,16 @@ interface TranscriptDao {
     suspend fun setSpeakerManual(ids: List<Long>, name: String?)
 
     /**
+     * 确认机器猜的名字（名字不变，只把它从「机器猜」转成「人工确认」）。
+     *
+     * 为什么不复用 [setSpeakerManual]：那条 SQL 会把 `syncState` 置 1，
+     * 而确认时 speakerName 没变、payload 里也没有 speakerEdited 这一位，
+     * 云端那份内容完全一样 —— 标脏只会白跑一次上行。
+     */
+    @Query("UPDATE transcript SET speakerEdited = 1 WHERE id IN (:ids)")
+    suspend fun markSpeakerConfirmed(ids: List<Long>)
+
+    /**
      * 首次编辑时留存 ASR 原文。
      *
      * 带 `asrRaw IS NULL` 条件而不是先读后写：并发的两次编辑都读到 null 时，
@@ -1155,6 +1165,12 @@ suspend fun VoiceLogDatabase.applyTextEdit(
  * 逐行读旧值是为了记下「机器判的是谁 → 人改成谁」这条对照：
  * 只改不记的话，改判率和「机器错在哪儿」都无从查起。
  * 同值跳过，避免批量重铺时把没变的行也记一笔。
+ *
+ * **同值不等于无事可做**：F0 兜底猜出来的名字本身就写在 `speakerName` 上，
+ * 用户点标签选「就是这个名字」时，传进来的 name 与旧值相同 —— 若在这里直接跳过，
+ * `speakerEdited` 永远置不上，「?」标记永远消不掉，这句也就永远留在「机器猜」筛选里。
+ * 所以同值分支要先判是不是「机器猜待确认」：是则转成人工确认（不记账、不算改判），
+ * 否则才真的跳过。
  */
 suspend fun VoiceLogDatabase.applySpeakerEdit(
     ids: List<Long>,
@@ -1168,7 +1184,16 @@ suspend fun VoiceLogDatabase.applySpeakerEdit(
     ids.forEach { id ->
         val row = dao.byId(id) ?: return@forEach
         if (row.deletedAt > 0L) return@forEach
-        if (row.speakerName == name) return@forEach
+        if (row.speakerName == name) {
+            /* 确认：名字没变，但这行是机器猜的、还没被人工确认过。
+               不写审计 —— 审计表记的是「机器判成什么、人改成什么」，
+               名字没动就没有改判可言，写进去会把改判率统计污染成假的。 */
+            if (!row.speakerEdited && row.speakerAuto == TranscriptEntity.AUTO_F0_GUESS) {
+                dao.markSpeakerConfirmed(listOf(id))
+                changed++
+            }
+            return@forEach
+        }
         dao.setSpeakerManual(listOf(id), name)
         edits.insert(
             TranscriptEditEntity(
