@@ -2,7 +2,9 @@ package com.misaka.voicelog
 
 import android.app.Application
 import com.misaka.voicelog.core.AppPrefs
+import com.misaka.voicelog.core.PersonStore
 import com.misaka.voicelog.core.RecycleBin
+import com.misaka.voicelog.core.VoiceprintStore
 import com.misaka.voicelog.service.VoiceLogDatabaseHolder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +39,15 @@ class VoiceLogApp : Application() {
                         .forEach { dao.renameSpeakerAlias(it, AppPrefs.NOISE_LABEL) }
                     AppPrefs.markNoiseRenameDone(this@VoiceLogApp)
                 }
+            }
+        }
+
+        /* 「人」这一层的结构迁移（档案自带名字 → 人 + 档案）。
+           放启动时跑，是为了让用户「打开就看见分组是对的」，而不是等他去设置页
+           或者录完一轮才发现。迁移本身是幂等的，标志位在函数内部维护。 */
+        scope.launch {
+            runCatching {
+                PersonStore.ensureMigrated(this@VoiceLogApp, VoiceprintStore.profiles(this@VoiceLogApp))
             }
         }
     }

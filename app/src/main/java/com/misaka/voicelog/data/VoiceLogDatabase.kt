@@ -109,6 +109,25 @@ interface TranscriptDao {
     @Query("UPDATE transcript SET speakerName = :name WHERE sessionId = :sessionId")
     suspend fun setSpeakerForSession(sessionId: Long, name: String?)
 
+    /**
+     * 某人改名后，把历史句子里那个旧名一起改掉。
+     *
+     * 为什么必须级联：transcript 存的是**名字字符串**，不是 personId。
+     * 不级联的话，改名之后同一个人在新句子里叫新名、老句子里叫旧名，
+     * 统计里就会裂成两个人 —— 这正是 2026-11-21 那 5 + 30 句 chip 分裂的成因。
+     *
+     * 只改机器判的句子（`speakerEdited = 0`）：人工亲手标的名字可能另有意图
+     * （比如故意把一句电视声标成「电视噪音」），不能被一次改名冲掉。
+     *
+     * 不改 [TranscriptEntity.autoSpeakerName]：那是「机器当时判的是谁」的审计快照，
+     * 后期操作去改它，等于篡改证据 —— 改判率就再也算不准了。
+     */
+    @Query(
+        "UPDATE transcript SET speakerName = :newName " +
+            "WHERE speakerName = :oldName AND speakerEdited = 0 AND deletedAt = 0",
+    )
+    suspend fun renameSpeakerEverywhere(oldName: String, newName: String): Int
+
     @Query("UPDATE transcript SET text = :text, edited = 1 WHERE id = :id")
     suspend fun updateText(id: Long, text: String)
 

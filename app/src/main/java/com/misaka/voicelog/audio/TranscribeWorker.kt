@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.misaka.voicelog.core.AppPrefs
 import com.misaka.voicelog.core.ModelPaths
+import com.misaka.voicelog.core.PersonStore
 import com.misaka.voicelog.core.VoiceprintStore
 import com.misaka.voicelog.data.SegmentEntity
 import com.misaka.voicelog.service.VoiceLogDatabaseHolder
@@ -151,9 +152,18 @@ object TranscribeWorker {
         // ---- 引擎只在本次任务期间存在，跑完必须释放（这是省内存的全部意义）----
         var engine: com.misaka.voicelog.asr.AsrEngine? = null
         var speaker: com.misaka.voicelog.asr.SpeakerEngine? = null
-        val profiles = VoiceprintStore.profiles(ctx)
         val threshold = VoiceprintStore.threshold(ctx)
-        val myName = VoiceprintStore.myName(ctx)
+        /* 人名与归属。v4 起「人」是独立一层：名字只存在 PersonStore，档案只记 personId。
+           迁移要在读档案之前跑 —— 它会把 personId 写回文件头，之后必须重读一次，
+           否则内存里还是 personId = null 的旧对象，match 出来的结果挂不上人。 */
+        PersonStore.ensureMigrated(ctx, VoiceprintStore.profiles(ctx))
+        val profiles = VoiceprintStore.profiles(ctx)
+        val persons = PersonStore.list(ctx)
+        /* F0 只能证明「是哪个性别」，证不出「是哪个具体的人」。
+           恰好 1 人时落名字；0 人（还没设性别）或 ≥2 人（物理上分不开）一律留未判。
+           这是唯一诚实的做法 —— 女声侧实测错 42.6%，根因就是那里站着两个候选。 */
+        val maleSole = persons.singleOrNull { it.gender == PersonStore.GENDER_MALE }
+        val femaleSole = persons.singleOrNull { it.gender == PersonStore.GENDER_FEMALE }
         /* 每条会话当时用的录音通路。声纹只认同一通路的档案 ——
            跨通路的相似度与陌生人无异（2026-11-11 实测 0.25 vs 0.24），
            混着比等于随机落名字。空 map 表示读失败，那就整批不做声纹判定。 */
@@ -164,9 +174,6 @@ object TranscribeWorker {
         val f0On = AppPrefs.f0Enabled(ctx)
         val f0MaleMax = AppPrefs.f0MaleMax(ctx)
         val f0FemaleMin = AppPrefs.f0FemaleMin(ctx)
-        /* 映射到听标那两个名字，单一数据源 */
-        val f0MaleName = AppPrefs.abA(ctx)
-        val f0FemaleName = AppPrefs.abB(ctx)
 
         var okCount = 0
         var failCount = 0
@@ -241,10 +248,17 @@ object TranscribeWorker {
                         val best = VoiceprintStore.match(usableProfiles, emb)
                         score = best?.score ?: 0f
                         if (best != null && score >= threshold) {
-                            label = best.name
+                            /* 显示用 Person 的名字，不用档案里的名字：
+                               档案里的 name 只是建档时的快照，用户改名后不会变，
+                               直接用它会出现「列表里叫说话人A、设置里叫新名」的错位。 */
+                            val person = best.personId?.let { pid ->
+                                persons.firstOrNull { it.id == pid }
+                            }
+                            label = person?.name ?: best.name
                             /* 「我」和「某个具名档案」要分开记：前者是自我识别，
-                               后者是熟人识别。混成一个值，日后就没法单独评估自己的召回率。 */
-                            auto = if (best.name == myName) {
+                               后者是熟人识别。混成一个值，日后就没法单独评估自己的召回率。
+                               判据是 Person.isSelf，不再比名字字符串 —— 改名不该让统计口径变。 */
+                            auto = if (person?.isSelf == true) {
                                 com.misaka.voicelog.data.TranscriptEntity.AUTO_ME
                             } else {
                                 com.misaka.voicelog.data.TranscriptEntity.AUTO_NAMED
@@ -272,16 +286,23 @@ object TranscribeWorker {
                         f0 = hz.toInt()
                         when {
                             hz <= f0MaleMax -> {
-                                label = f0MaleName
-                                /* 记成 F0_GUESS 而不是 NAMED：F0 只能证明「不是女声」，
-                                   证不出「具体是谁」。实测男声侧错 3.7%、
-                                   女声侧错 42.6%（候选有两个，F0 分不开），
-                                   与声纹命中（0.7%）差一个数量级，界面上必须能分开。 */
-                                auto = com.misaka.voicelog.data.TranscriptEntity.AUTO_F0_GUESS
+                                /* 只在该性别恰好一个人时落名字。0 人 = 还没设性别，
+                                   ≥2 人 = 物理上分不开 —— 两种情况都留未判，
+                                   而不是像以前那样落一个"男声"这样的假人。 */
+                                label = maleSole?.name
+                                auto = if (label != null) {
+                                    com.misaka.voicelog.data.TranscriptEntity.AUTO_F0_GUESS
+                                } else {
+                                    com.misaka.voicelog.data.TranscriptEntity.AUTO_UNKNOWN
+                                }
                             }
                             hz >= f0FemaleMin -> {
-                                label = f0FemaleName
-                                auto = com.misaka.voicelog.data.TranscriptEntity.AUTO_F0_GUESS
+                                label = femaleSole?.name
+                                auto = if (label != null) {
+                                    com.misaka.voicelog.data.TranscriptEntity.AUTO_F0_GUESS
+                                } else {
+                                    com.misaka.voicelog.data.TranscriptEntity.AUTO_UNKNOWN
+                                }
                             }
                         }
                     }

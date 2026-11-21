@@ -1,7 +1,12 @@
 package com.misaka.voicelog.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -10,6 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -34,6 +40,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -44,6 +51,7 @@ import com.misaka.voicelog.audio.BoundMicRecorder
 import com.misaka.voicelog.audio.MicRoute
 import com.misaka.voicelog.core.AppPrefs
 import com.misaka.voicelog.core.ModelPaths
+import com.misaka.voicelog.core.PersonStore
 import com.misaka.voicelog.core.VoiceprintStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -82,9 +90,28 @@ private class MicCapture(
     val note: String?,
 )
 
+/** 录入页的小选择块：选人 / 选性别。样式和设置页的 GenderChip 一致 */
+@Composable
+private fun EnrollChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (selected) VlColor.MeBg else VlColor.SurfaceVar)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+    ) {
+        Text(
+            label,
+            fontSize = 12.sp,
+            color = if (selected) VlColor.MeFg else VlColor.Sub,
+        )
+    }
+}
+
 /**
  * @param editProfileId 非空 = 重录已有的某个人（会覆盖其样本，名字沿用原值）
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun VoiceprintEnrollScreen(
     editProfileId: String? = null,
@@ -98,7 +125,6 @@ fun VoiceprintEnrollScreen(
         editProfileId?.let { VoiceprintStore.profileById(ctx, it) }
     }
     val allCount = remember { VoiceprintStore.profiles(ctx).size }
-    val selfId = remember { VoiceprintStore.selfId(ctx) }
 
     val collected = remember { mutableStateListOf<FloatArray>() }
     var step by remember { mutableStateOf(0) }
@@ -117,21 +143,36 @@ fun VoiceprintEnrollScreen(
     val noneBound = remember { AppPrefs.inputDeviceId(ctx) == 0 }
 
     // 名字先填好能省一次点击：新建时给出「我」或「说话人 2」，用户可以改
+    /* 归属人。这是「人」这一层（[PersonStore]）的 id —— 名字和性别都挂在人身上，
+       档案只记归属。null = 这次要新建一个人。
+
+       为什么必须能选已有的「人」：同一个人换一支麦就要录一份新档案，
+       如果每次都新建，说话人A在内置麦和蓝牙上就变成两个互不相干的"说话人A"，
+       统计里又会裂开 —— 跟这次要修的 bug 是同一个成因。 */
+    val persons = remember { PersonStore.list(ctx) }
+    val existingPerson = remember(existing?.personId) {
+        PersonStore.byId(ctx, existing?.personId)
+    }
+    var ownerId by remember { mutableStateOf(existingPerson?.id) }
     var nameInput by remember {
         mutableStateOf(
-            existing?.name ?: if (allCount == 0) VoiceprintStore.DEFAULT_NAME else "说话人 ${allCount + 1}",
+            existingPerson?.name
+                ?: if (persons.isEmpty()) VoiceprintStore.DEFAULT_NAME else "说话人 ${persons.size + 1}",
         )
     }
-    // 第一份档案默认就是「我」；重录「我」时锁定，重录别人时不改归属
+    var gender by remember { mutableStateOf(existingPerson?.gender ?: PersonStore.GENDER_UNKNOWN) }
+    // 第一份档案默认就是「我」；重录时锁定，重录别人时不改归属
     var asSelf by remember {
         mutableStateOf(
             when {
-                existing != null -> selfId == existing.id
-                else -> selfId == null
+                existingPerson != null -> existingPerson.isSelf
+                else -> persons.none { it.isSelf }
             },
         )
     }
-    val selfLocked = existing != null && selfId == existing.id
+    val selfLocked = existingPerson?.isSelf == true
+    /** 选中了已有人 → 名字和性别归那个人管，这里不给改（避免两处改名对不上） */
+    val ownerLocked = ownerId != null
 
     val spkReady = remember { ModelPaths.spkReady(ctx) }
     val overLimit = existing == null && allCount >= VoiceprintStore.MAX_PROFILES
@@ -252,7 +293,23 @@ fun VoiceprintEnrollScreen(
                     return@launch
                 }
                 withContext(Dispatchers.IO) {
-                    VoiceprintStore.saveProfile(ctx, id, nameInput, samples, key)
+                    /* 归属人：选中了已有人就沿用它的 id；新建就把这份档案的 id 当人的 id
+                       （省一层映射，也和 [PersonStore.ensureMigrated] 的约定保持一致）。 */
+                    val pid = ownerId ?: id
+                    VoiceprintStore.saveProfile(ctx, id, nameInput, samples, key, pid)
+                    if (ownerId == null) {
+                        PersonStore.upsert(
+                            ctx,
+                            PersonStore.Person(
+                                id = pid,
+                                name = nameInput.trim().ifBlank { "某人" },
+                                gender = gender,
+                                isSelf = asSelf,
+                            ),
+                        )
+                    } else if (asSelf) {
+                        PersonStore.setSelf(ctx, pid)
+                    }
                     if (asSelf) VoiceprintStore.setSelfId(ctx, id)
                 }
                 consistency = VoiceprintStore.consistency(samples)
@@ -360,9 +417,47 @@ fun VoiceprintEnrollScreen(
                 Column(Modifier.padding(14.dp)) {
                     Text("这是谁", fontSize = 12.sp, color = VlColor.Sub)
                     Spacer(Modifier.height(6.dp))
+
+                    /* 已注册过的人要能直接选。同一个人换一支麦克风就得另录一份档案，
+                       如果每次都只能新建，说话人A在内置麦和蓝牙上就变成两个独立的"说话人A"，
+                       统计里立刻裂开 —— 这正是要修的那个 bug 的成因。 */
+                    if (persons.isNotEmpty()) {
+                        Text(
+                            "给已有的人补一支麦克风，直接选他；新面孔才选「新的人」。",
+                            fontSize = 10.sp,
+                            color = VlColor.Dim,
+                            lineHeight = 14.sp,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            EnrollChip("＋ 新的人", selected = ownerId == null) {
+                                ownerId = null
+                                nameInput = "说话人 ${persons.size + 1}"
+                                gender = PersonStore.GENDER_UNKNOWN
+                                asSelf = persons.none { it.isSelf }
+                            }
+                            persons.forEach { p ->
+                                EnrollChip(
+                                    label = if (p.isSelf) "${p.name}（我）" else p.name,
+                                    selected = ownerId == p.id,
+                                ) {
+                                    ownerId = p.id
+                                    nameInput = p.name
+                                    gender = p.gender
+                                    asSelf = p.isSelf
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                    }
+
                     OutlinedTextField(
                         value = nameInput,
-                        onValueChange = { nameInput = it.take(12) },
+                        onValueChange = { if (!ownerLocked) nameInput = it.take(12) },
+                        enabled = !ownerLocked,
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
                         placeholder = { Text("如「老婆」「小王」", fontSize = 13.sp, color = VlColor.Dim) },
@@ -370,8 +465,46 @@ fun VoiceprintEnrollScreen(
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = VlColor.Accent,
                             unfocusedBorderColor = VlColor.Line,
+                            disabledTextColor = VlColor.Sub,
+                            disabledBorderColor = VlColor.Line,
                         ),
                     )
+
+                    if (ownerLocked) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "名字和性别属于「人」，改名请到设置 → 声纹里改，那里会连带更新历史记录。",
+                            fontSize = 10.sp,
+                            color = VlColor.Dim,
+                            lineHeight = 14.sp,
+                        )
+                    } else {
+                        Spacer(Modifier.height(10.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("性别", fontSize = 12.sp, color = VlColor.Sub)
+                            Spacer(Modifier.width(8.dp))
+                            EnrollChip("男", gender == PersonStore.GENDER_MALE) {
+                                gender = PersonStore.GENDER_MALE
+                            }
+                            Spacer(Modifier.width(6.dp))
+                            EnrollChip("女", gender == PersonStore.GENDER_FEMALE) {
+                                gender = PersonStore.GENDER_FEMALE
+                            }
+                            Spacer(Modifier.width(6.dp))
+                            EnrollChip("不用", gender == PersonStore.GENDER_UNKNOWN) {
+                                gender = PersonStore.GENDER_UNKNOWN
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "声纹认不出时，程序会按声音高低猜男女；只有这个性别下一个人时，" +
+                                "才会把句子标成他的名字。设「不用」就只靠声纹认。",
+                            fontSize = 9.sp,
+                            color = VlColor.Dim,
+                            lineHeight = 13.sp,
+                        )
+                    }
+
                     Spacer(Modifier.height(8.dp))
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -379,8 +512,8 @@ fun VoiceprintEnrollScreen(
                     ) {
                         Checkbox(
                             checked = asSelf,
-                            onCheckedChange = { if (!selfLocked) asSelf = it },
-                            enabled = !selfLocked,
+                            onCheckedChange = { if (!selfLocked && !ownerLocked) asSelf = it },
+                            enabled = !selfLocked && !ownerLocked,
                             colors = CheckboxDefaults.colors(
                                 checkedColor = VlColor.Accent,
                                 uncheckedColor = VlColor.Dim,
@@ -388,13 +521,21 @@ fun VoiceprintEnrollScreen(
                         )
                         Column {
                             Text(
-                                if (selfLocked) "这是「我」本人" else "标记为「我」本人",
+                                when {
+                                    ownerLocked && asSelf -> "这是「我」本人"
+                                    ownerLocked -> "这是「$nameInput」"
+                                    selfLocked -> "这是「我」本人"
+                                    else -> "标记为「我」本人"
+                                },
                                 fontSize = 13.sp,
                                 color = VlColor.Text,
                             )
                             Text(
-                                if (selfLocked) "本人声纹不能改归属，如需更换请另建一个「我」的档案"
-                                else "勾选后，判到此人的句子在统计里计入「我」",
+                                when {
+                                    ownerLocked -> "归属已跟随已注册的人，这里不用再设"
+                                    selfLocked -> "本人声纹不能改归属，如需更换请另建一个「我」的档案"
+                                    else -> "勾选后，判到此人的句子在统计里计入「我」"
+                                },
                                 fontSize = 10.sp,
                                 color = VlColor.Dim,
                                 lineHeight = 14.sp,

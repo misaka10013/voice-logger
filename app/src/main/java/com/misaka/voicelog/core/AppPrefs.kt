@@ -201,11 +201,15 @@ object AppPrefs {
     // ------------------------------------------------------------ 基频判男女
 
     /**
-     * 是否用基频（F0）自动判男女并按 [f0MaleLabel] / [f0FemaleLabel] 落人名。
+     * 是否用基频（F0）兜底判人。
+     *
+     * 落谁的名字不由这里决定：判出性别后去 [PersonStore] 查这个性别下的人，
+     * **恰好一个人**才落名字，0 人或 ≥2 人都留「未判」——
+     * F0 只能证明"是哪个性别"，证不出"是哪个具体的人"。
      *
      * ⚠️ 这是**概率判定**，不是事实：11-09 实测 F0 双峰分离度 3.02，
      * 但 160~200Hz 之间的边界区间有 15.6% 判不准，这类一律留「未判」不猜。
-     * 电视里的女播音也会被判成配置里的女声名字 —— 那几句得人工改。
+     * 电视里的女播音也会被判成该性别那个人 —— 那几句得人工改。
      */
     fun f0Enabled(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_F0_ENABLED, true)
 
@@ -229,19 +233,10 @@ object AppPrefs {
         prefs(ctx).edit().putFloat(KEY_F0_FEMALE_MIN, v.coerceIn(160f, 320f)).apply()
     }
 
-    fun f0MaleLabel(ctx: Context): String =
-        prefs(ctx).getString(KEY_F0_MALE_LABEL, DEFAULT_AB_A)?.takeIf { it.isNotBlank() } ?: DEFAULT_AB_A
-
-    fun setF0MaleLabel(ctx: Context, v: String) {
-        prefs(ctx).edit().putString(KEY_F0_MALE_LABEL, v.trim().take(12)).apply()
-    }
-
-    fun f0FemaleLabel(ctx: Context): String =
-        prefs(ctx).getString(KEY_F0_FEMALE_LABEL, DEFAULT_AB_B)?.takeIf { it.isNotBlank() } ?: DEFAULT_AB_B
-
-    fun setF0FemaleLabel(ctx: Context, v: String) {
-        prefs(ctx).edit().putString(KEY_F0_FEMALE_LABEL, v.trim().take(12)).apply()
-    }
+    /* ⚠️ 2026-11-21 删掉了 f0MaleLabel / f0FemaleLabel 两组读写函数。
+       它们从「基频判男女」改走 PersonStore 之后就没用了，但一直留在文件里 ——
+       两套配置源并存，改了一个另一个没变，正是这次「说话人A被劈成说话人A + 我」的成因之一。
+       旧 prefs 里的 KEY_F0_MALE_LABEL / KEY_F0_FEMALE_LABEL 不再读取，留着不影响启动。 */
 
     // ------------------------------------------------------------ 录音输入设备
 

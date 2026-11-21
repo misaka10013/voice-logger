@@ -57,6 +57,7 @@ import androidx.compose.ui.unit.sp
 import com.misaka.voicelog.audio.MicRoute
 import com.misaka.voicelog.core.AppPrefs
 import com.misaka.voicelog.core.ModelPaths
+import com.misaka.voicelog.core.PersonStore
 import com.misaka.voicelog.core.PersonTags
 import com.misaka.voicelog.core.ProofreadClient
 import com.misaka.voicelog.core.SyncManager
@@ -87,12 +88,17 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
 
     var profiles by remember { mutableStateOf<List<VoiceprintStore.Profile>>(emptyList()) }
     var consistencies by remember { mutableStateOf<Map<String, Float?>>(emptyMap()) }
-    var selfId by remember { mutableStateOf<String?>(null) }
     var meName by remember { mutableStateOf(VoiceprintStore.myName(ctx)) }
 
-    var renameTarget by remember { mutableStateOf<VoiceprintStore.Profile?>(null) }
+    /* 「人」这一层。名字只存这里一份，档案只记 personId —— 见 [PersonStore] 的说明。
+       设置页必须按「人」分组展示，否则用户看到的还是 4 份独立档案，
+       根本不知道「说话人A」那两份其实是同一个人。 */
+    var persons by remember { mutableStateOf<List<PersonStore.Person>>(emptyList()) }
+
+    var renamePersonTarget by remember { mutableStateOf<PersonStore.Person?>(null) }
     var editFallbackName by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<VoiceprintStore.Profile?>(null) }
+    var pendingDeletePerson by remember { mutableStateOf<PersonStore.Person?>(null) }
     var showClearVp by remember { mutableStateOf(false) }
 
     var threshold by remember { mutableStateOf(VoiceprintStore.threshold(ctx)) }
@@ -121,8 +127,8 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
     var f0On by remember { mutableStateOf(AppPrefs.f0Enabled(ctx)) }
     var f0MaleMax by remember { mutableStateOf(AppPrefs.f0MaleMax(ctx)) }
     var f0FemaleMin by remember { mutableStateOf(AppPrefs.f0FemaleMin(ctx)) }
-    var f0MaleName by remember { mutableStateOf(AppPrefs.f0MaleLabel(ctx)) }
-    var f0FemaleName by remember { mutableStateOf(AppPrefs.f0FemaleLabel(ctx)) }
+    /* 听标底部两个按钮的名字。它跟 F0 兜底已经彻底分开 ——
+       之前两者共用同一份配置，导致「改听标按钮名」会静默改变转写结果。 */
     var abAName by remember { mutableStateOf(AppPrefs.abA(ctx)) }
     var abBName by remember { mutableStateOf(AppPrefs.abB(ctx)) }
     var inputDeviceId by remember { mutableStateOf(AppPrefs.inputDeviceId(ctx)) }
@@ -158,15 +164,29 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
 
     val batteryWhitelisted = remember { isIgnoringBatteryOptimizations(ctx) }
 
+    val verLabel = remember {
+        runCatching {
+            @Suppress("DEPRECATION")
+            val pi = ctx.packageManager.getPackageInfo(ctx.packageName, 0)
+            "v${pi.versionName} (${pi.longVersionCode})"
+        }.getOrDefault("")
+    }
+
     suspend fun reload() {
-        val ps = withContext(Dispatchers.IO) { VoiceprintStore.profiles(ctx) }
+        var ps = withContext(Dispatchers.IO) { VoiceprintStore.profiles(ctx) }
+        /* 迁移要把 personId 写回档案文件头，写完之后内存里这份 list 就过期了
+           （personId 还是 null），必须重读 —— 否则界面会把所有人都归到「未归属」。 */
+        withContext(Dispatchers.IO) {
+            PersonStore.ensureMigrated(ctx, ps)
+            ps = VoiceprintStore.profiles(ctx)
+        }
         // 一致性要读全部样本算两两余弦，放在 IO 里做，别卡住界面
         val cs = withContext(Dispatchers.IO) {
             ps.associate { it.id to VoiceprintStore.consistency(it.samples) }
         }
         profiles = ps
         consistencies = cs
-        selfId = VoiceprintStore.selfId(ctx)
+        persons = withContext(Dispatchers.IO) { PersonStore.list(ctx) }
         meName = VoiceprintStore.myName(ctx)
         threshold = VoiceprintStore.threshold(ctx)
         tags = PersonTags.list(ctx)
@@ -208,7 +228,18 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
     ) {
         Spacer(Modifier.height(14.dp))
-        Text("设置", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = VlColor.Text)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("设置", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = VlColor.Text)
+            /* 版本号必须露出来：装完新版要能自查"我装的到底是不是这一版"。
+               之前没显示，出问题时只能靠猜，或者去系统的应用信息里翻。 */
+            Spacer(Modifier.width(8.dp))
+            Text(
+                verLabel,
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                color = VlColor.Dim,
+            )
+        }
         Spacer(Modifier.height(12.dp))
 
         // ---------------------------------------------- 识别质量
@@ -237,19 +268,19 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
         }
 
         // ---------------------------------------------- 声纹档案
-        SettingsCard("声纹 · 已注册 ${profiles.size} 人") {
+        SettingsCard("声纹 · ${persons.size} 个人 · ${profiles.size} 份档案") {
             /* 这一段是整套声纹能不能用的前提，必须写在最显眼的位置：
                实测同一个人换个麦克风，相似度从 0.65 掉到 0.25，与陌生人（0.24）
                没有区别。不解释这一点，用户会以为是识别不准，其实是音源换了。 */
             Text(
-                "声纹绑在「录音输入」里选的那支麦克风上。换麦之后要重新录 —— " +
-                    "同一句话换个麦克风，程序听起来就像换了一个人。",
+                "同一个人换一支麦克风就是另一份档案，要单独录。" +
+                    "名字属于「人」，改一次名，历史记录里跟着一起改。",
                 fontSize = 10.sp,
                 color = VlColor.Dim,
                 lineHeight = 15.sp,
             )
             Spacer(Modifier.height(10.dp))
-            if (profiles.isEmpty()) {
+            if (persons.isEmpty() && profiles.isEmpty()) {
                 Text(
                     "还没有任何声纹。注册后，说话人会被自动标上名字，不用事后一句句改。",
                     fontSize = 12.sp,
@@ -283,14 +314,15 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
                     Text("录入第一个人的声纹", fontSize = 13.sp, fontWeight = FontWeight.Medium)
                 }
             } else {
-                profiles.forEachIndexed { i, p ->
+                persons.forEachIndexed { i, person ->
                     if (i > 0) {
-                        Spacer(Modifier.height(8.dp))
+                        Spacer(Modifier.height(12.dp))
                         Box(Modifier.fillMaxWidth().height(1.dp).background(VlColor.Line))
-                        Spacer(Modifier.height(8.dp))
+                        Spacer(Modifier.height(12.dp))
                     }
-                    val isSelf = p.id == selfId
-                    val c = consistencies[p.id]
+                    val mine = profiles.filter { it.personId == person.id }
+
+                    // ---- 人这一行：名字、是否本人、删除 ----
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             Modifier
@@ -298,69 +330,140 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
                                 .background(VlColor.Green, RoundedCornerShape(4.dp)),
                         )
                         Spacer(Modifier.width(8.dp))
-                        Column(Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    p.name,
-                                    fontSize = 14.sp,
-                                    color = VlColor.Text,
-                                    fontWeight = FontWeight.Medium,
-                                    modifier = Modifier.clickable { renameTarget = p },
-                                )
-                                if (isSelf) {
-                                    Spacer(Modifier.width(6.dp))
-                                    Box(
-                                        Modifier
-                                            .background(VlColor.MeBg, RoundedCornerShape(3.dp))
-                                            .padding(horizontal = 4.dp, vertical = 1.dp),
-                                    ) {
-                                        Text("我", fontSize = 9.sp, color = VlColor.MeFg)
-                                    }
-                                }
-                                if (!isSelf) {
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(
-                                        "设为「我」",
-                                        fontSize = 9.sp,
-                                        color = VlColor.Accent,
-                                        modifier = Modifier.clickable {
-                                            VoiceprintStore.setSelfId(ctx, p.id)
-                                            scope.launch { reload() }
-                                        },
-                                    )
-                                }
+                        Text(
+                            person.name,
+                            fontSize = 15.sp,
+                            color = VlColor.Text,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.clickable { renamePersonTarget = person },
+                        )
+                        if (person.isSelf) {
+                            Spacer(Modifier.width(6.dp))
+                            Box(
+                                Modifier
+                                    .background(VlColor.MeBg, RoundedCornerShape(3.dp))
+                                    .padding(horizontal = 4.dp, vertical = 1.dp),
+                            ) {
+                                Text("我", fontSize = 9.sp, color = VlColor.MeFg)
                             }
+                        } else {
+                            Spacer(Modifier.width(6.dp))
                             Text(
-                                text = buildString {
-                                    append("${p.sampleCount} 句样本")
-                                    if (c != null) append(" · 一致性 %.2f".format(c))
-                                },
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = when {
-                                    c == null -> VlColor.Dim
-                                    c >= 0.70f -> VlColor.Green.copy(alpha = 0.85f)
-                                    c >= 0.55f -> VlColor.Amber
-                                    else -> VlColor.Red
+                                "设为「我」",
+                                fontSize = 9.sp,
+                                color = VlColor.Accent,
+                                modifier = Modifier.clickable {
+                                    PersonStore.setSelf(ctx, person.id)
+                                    mine.firstOrNull()?.let { VoiceprintStore.setSelfId(ctx, it.id) }
+                                    scope.launch { reload() }
                                 },
                             )
-                            /* 哪支麦录的。旧版档案没有这个字段（null）→ 不参与判定。
-                               旧版注册代码没指定输入设备，走系统默认（= 内置麦，除非当时插着耳机），
-                               所以给一个一键补绑入口，而不是拿"重录 4 句"当唯一出路。 */
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                        }
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            "删除此人",
+                            fontSize = 10.sp,
+                            color = VlColor.Dim,
+                            modifier = Modifier.clickable { pendingDeletePerson = person },
+                        )
+                    }
+
+                    // ---- 性别：只影响「基频兜底」能不能落名字 ----
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(start = 15.dp),
+                    ) {
+                        Text(
+                            "基频兜底",
+                            fontSize = 10.sp,
+                            color = VlColor.Dim,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        GenderChip("男", person.gender == PersonStore.GENDER_MALE) {
+                            PersonStore.setGender(ctx, person.id, PersonStore.GENDER_MALE)
+                            scope.launch { reload() }
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        GenderChip("女", person.gender == PersonStore.GENDER_FEMALE) {
+                            PersonStore.setGender(ctx, person.id, PersonStore.GENDER_FEMALE)
+                            scope.launch { reload() }
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        GenderChip("不用", person.gender == PersonStore.GENDER_UNKNOWN) {
+                            PersonStore.setGender(ctx, person.id, PersonStore.GENDER_UNKNOWN)
+                            scope.launch { reload() }
+                        }
+                    }
+                    Text(
+                        text = when (person.gender) {
+                            PersonStore.GENDER_MALE ->
+                                if (persons.count { it.gender == PersonStore.GENDER_MALE } == 1) {
+                                    "声纹认不出时，男声的句子会标成「${person.name}」"
+                                } else {
+                                    "有 ${persons.count { it.gender == PersonStore.GENDER_MALE }} 个男声，分不开，这类句子留「未判」"
+                                }
+                            PersonStore.GENDER_FEMALE ->
+                                if (persons.count { it.gender == PersonStore.GENDER_FEMALE } == 1) {
+                                    "声纹认不出时，女声的句子会标成「${person.name}」"
+                                } else {
+                                    "有 ${persons.count { it.gender == PersonStore.GENDER_FEMALE }} 个女声，分不开，这类句子留「未判」"
+                                }
+                            else -> "不参与基频兜底，只靠声纹认这个人"
+                        },
+                        fontSize = 9.sp,
+                        color = VlColor.Dim,
+                        lineHeight = 13.sp,
+                        modifier = Modifier.padding(start = 15.dp, top = 3.dp),
+                    )
+
+                    // ---- 这个人名下的每支麦克风 ----
+                    if (mine.isEmpty()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "这个人还没有声纹档案",
+                            fontSize = 10.sp,
+                            color = VlColor.Amber,
+                            modifier = Modifier.padding(start = 15.dp),
+                        )
+                    }
+                    mine.forEach { p ->
+                        val c = consistencies[p.id]
+                        Spacer(Modifier.height(6.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(start = 15.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
                                 Text(
-                                    text = "麦：" + MicRoute.keyLabel(p.micKey),
-                                    fontSize = 10.sp,
-                                    color = if (p.micKey.isNullOrBlank()) VlColor.Amber else VlColor.Dim,
-                                    lineHeight = 14.sp,
+                                    MicRoute.keyLabel(p.micKey),
+                                    fontSize = 12.sp,
+                                    color = if (p.micKey.isNullOrBlank()) VlColor.Amber else VlColor.Text,
                                 )
+                                Text(
+                                    text = buildString {
+                                        append("${p.sampleCount} 句")
+                                        if (c != null) append(" · 一致性 %.2f".format(c))
+                                    },
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = when {
+                                        c == null -> VlColor.Dim
+                                        c >= 0.70f -> VlColor.Green.copy(alpha = 0.85f)
+                                        c >= 0.55f -> VlColor.Amber
+                                        else -> VlColor.Red
+                                    },
+                                )
+                                /* 旧版档案没有通路字段（null）→ 不参与任何判定。
+                                   旧版注册代码没指定输入设备，走系统默认（= 内置麦，除非当时插着耳机），
+                                   所以给一个一键补绑入口，而不是拿"重录 4 句"当唯一出路。 */
                                 if (p.micKey.isNullOrBlank()) {
-                                    Spacer(Modifier.width(8.dp))
                                     Text(
                                         "补绑内置麦",
                                         fontSize = 10.sp,
                                         color = VlColor.Accent,
                                         modifier = Modifier
+                                            .padding(top = 2.dp)
                                             .clip(RoundedCornerShape(4.dp))
                                             .background(VlColor.SurfaceVar)
                                             .clickable {
@@ -371,12 +474,40 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
                                     )
                                 }
                             }
+                            TextButton(onClick = { onEnroll(p.id) }) {
+                                Text("重录", fontSize = 11.sp, color = VlColor.Accent)
+                            }
+                            TextButton(onClick = { pendingDelete = p }) {
+                                Text("删除", fontSize = 11.sp, color = VlColor.Dim)
+                            }
                         }
-                        TextButton(onClick = { onEnroll(p.id) }) {
-                            Text("重录", fontSize = 11.sp, color = VlColor.Accent)
-                        }
-                        TextButton(onClick = { pendingDelete = p }) {
-                            Text("删除", fontSize = 11.sp, color = VlColor.Red)
+                    }
+                }
+
+                // 迁移后仍可能有档案挂不到人（比如人已被删但档案还在），
+                // 不能让它们消失 —— 消失的档案在界面上看不见，也就永远删不掉。
+                val orphans = profiles.filter { p -> persons.none { it.id == p.personId } }
+                if (orphans.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(VlColor.Line))
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "未归属的档案 ${orphans.size} 份",
+                        fontSize = 11.sp,
+                        color = VlColor.Amber,
+                    )
+                    orphans.forEach { p ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "${p.name} · ${MicRoute.keyLabel(p.micKey)}",
+                                    fontSize = 11.sp,
+                                    color = VlColor.Sub,
+                                )
+                            }
+                            TextButton(onClick = { pendingDelete = p }) {
+                                Text("删除", fontSize = 11.sp, color = VlColor.Dim)
+                            }
                         }
                     }
                 }
@@ -395,8 +526,8 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
                     shape = RoundedCornerShape(10.dp),
                 ) {
                     Text(
-                        if (profiles.size < VoiceprintStore.MAX_PROFILES) "＋ 添加一个说话人"
-                        else "已达 ${VoiceprintStore.MAX_PROFILES} 人上限",
+                        if (profiles.size < VoiceprintStore.MAX_PROFILES) "＋ 录入一个人的声纹"
+                        else "已达 ${VoiceprintStore.MAX_PROFILES} 份档案上限",
                         fontSize = 13.sp,
                     )
                 }
@@ -859,11 +990,12 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
 
         Spacer(Modifier.height(12.dp))
 
-        // ---------------------------------------------- 说话人名字
-        SettingsCard("说话人名字") {
+        // ---------------------------------------------- 听标按钮的名字
+        SettingsCard("听标按钮的名字") {
             Text(
-                "听标底部的两个按钮、以及下面的基频判男女，都用这两个名字。" +
-                    "固定下来后不用每轮进听标再手改一遍。",
+                "听标（边听边标）底部那两个快捷按钮上显示的字。" +
+                    "只影响手动打标时点哪个按钮，**不影响自动判定** —— " +
+                    "自动判定用的是「声纹」区里每个人自己的名字。",
                 fontSize = 10.sp,
                 color = VlColor.Dim,
                 lineHeight = 14.sp,
@@ -877,7 +1009,7 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
                         AppPrefs.setAbA(ctx, it)
                     },
                     modifier = Modifier.weight(1f),
-                    label = { Text("男声 / A", fontSize = 10.sp, color = VlColor.Dim) },
+                    label = { Text("左按钮", fontSize = 10.sp, color = VlColor.Dim) },
                     singleLine = true,
                     textStyle = TextStyle(fontSize = 13.sp, color = VlColor.Text),
                     colors = OutlinedTextFieldDefaults.colors(
@@ -893,7 +1025,7 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
                         AppPrefs.setAbB(ctx, it)
                     },
                     modifier = Modifier.weight(1f),
-                    label = { Text("女声 / B", fontSize = 10.sp, color = VlColor.Dim) },
+                    label = { Text("右按钮", fontSize = 10.sp, color = VlColor.Dim) },
                     singleLine = true,
                     textStyle = TextStyle(fontSize = 13.sp, color = VlColor.Text),
                     colors = OutlinedTextFieldDefaults.colors(
@@ -912,7 +1044,9 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
                 Column(Modifier.weight(1f)) {
                     Text("转写时按基频标人", fontSize = 13.sp, color = VlColor.Text)
                     Text(
-                        "男声→$abAName，女声→$abBName。只作用于还没标的句子，不覆盖你手标的。",
+                        "声纹认不出时，按声音高低猜是男是女，再落「声纹」区里那个人的名字。" +
+                            "每个性别只有一个人时才落名字，两个以上分不开就留「未判」。" +
+                            "只作用于还没标的句子，不覆盖你手标的。",
                         fontSize = 10.sp,
                         color = VlColor.Dim,
                         lineHeight = 13.sp,
@@ -1123,8 +1257,10 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("云端地址（到 /api 结尾）", fontSize = 11.sp, color = VlColor.Dim) },
                 placeholder = {
+                    /* 只写格式模板，不写任何真实域名 —— 真实地址由用户自己填。
+                       开源仓库里出现具体云环境域名，等于把后端入口公开了。 */
                     Text(
-                        "https://<env-id>.<region>.app.tcloudbase.com/api",
+                        "https://你的环境域名/api",
                         fontSize = 10.sp, color = VlColor.Dim,
                     )
                 },
@@ -1461,16 +1597,26 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
         )
     }
 
-    // ---------------------------------------------- 改名（档案）
-    renameTarget?.let { target ->
+    // ---------------------------------------------- 改名（人）
+    /* 改的是「人」，不是档案 —— 一个人可能有好几份档案（每支麦一份），
+       名字只在人这一层存一份，所以这里改一次就全改完了。
+       历史句子存的是名字字符串，必须级联 UPDATE 一次，否则同一个人的
+       老句子还挂着旧名，统计里会裂成两个人。 */
+    renamePersonTarget?.let { target ->
         var input by remember(target.id) { mutableStateOf(target.name) }
         AlertDialog(
-            onDismissRequest = { renameTarget = null },
+            onDismissRequest = { renamePersonTarget = null },
             containerColor = VlColor.Surface,
             title = { Text("改名字", fontSize = 15.sp, color = VlColor.Text) },
             text = {
                 Column {
-                    Text("改名会影响之后的自动判定标签，已经标好的句子不会变。", fontSize = 11.sp, color = VlColor.Dim)
+                    Text(
+                        "这个人名下的所有声纹档案都用新名字。历史记录里机器标的句子会一起改名，" +
+                            "你亲手标过的句子不动。",
+                        fontSize = 11.sp,
+                        color = VlColor.Dim,
+                        lineHeight = 16.sp,
+                    )
                     Spacer(Modifier.height(10.dp))
                     OutlinedTextField(
                         value = input,
@@ -1488,9 +1634,24 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
             confirmButton = {
                 TextButton(
                     onClick = {
-                        VoiceprintStore.renameProfile(ctx, target.id, input)
-                        renameTarget = null
-                        scope.launch { reload() }
+                        val newName = input.trim()
+                        renamePersonTarget = null
+                        if (newName.isNotBlank() && newName != target.name) {
+                            PersonStore.upsert(ctx, target.copy(name = newName))
+                            scope.launch {
+                                val n = withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        db.transcriptDao()
+                                            .renameSpeakerEverywhere(target.name, newName)
+                                    }.getOrDefault(0)
+                                }
+                                meName = VoiceprintStore.myName(ctx)
+                                reload()
+                                if (n > 0) {
+                                    exportMsg = "已把 $n 句历史记录里的「${target.name}」改成「$newName」"
+                                }
+                            }
+                        }
                     },
                     enabled = input.isNotBlank(),
                 ) {
@@ -1498,7 +1659,7 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
                 }
             },
             dismissButton = {
-                TextButton(onClick = { renameTarget = null }) {
+                TextButton(onClick = { renamePersonTarget = null }) {
                     Text("取消", color = VlColor.Sub)
                 }
             },
@@ -1549,15 +1710,29 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
         )
     }
 
-    // ---------------------------------------------- 删除某人
+    // ---------------------------------------------- 删除某份档案（某人在某支麦上）
     pendingDelete?.let { target ->
+        val personName = PersonStore.nameOf(ctx, target.personId, target.name)
+        val siblings = profiles.count { it.personId != null && it.personId == target.personId }
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
             containerColor = VlColor.Surface,
-            title = { Text("删除「${target.name}」的声纹？", fontSize = 15.sp, color = VlColor.Text) },
+            title = {
+                Text(
+                    "删除「$personName」在${MicRoute.keyLabel(target.micKey)}上的声纹？",
+                    fontSize = 14.sp,
+                    color = VlColor.Text,
+                    lineHeight = 20.sp,
+                )
+            },
             text = {
                 Text(
-                    "之后这个人的声音会被判成「他人」，已标好的句子不受影响。想恢复只能重新录 4 句。",
+                    if (siblings <= 1) {
+                        "这是「$personName」唯一的一份档案，删掉之后这个人就完全认不出来了。" +
+                            "已标好的句子不受影响，想恢复只能重新录 4 句。"
+                    } else {
+                        "用这支麦说的话不会再认出是「$personName」，其他麦克风上的档案不受影响。"
+                    },
                     fontSize = 12.sp,
                     color = VlColor.Sub,
                     lineHeight = 18.sp,
@@ -1566,9 +1741,18 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
             confirmButton = {
                 TextButton(
                     onClick = {
-                        VoiceprintStore.deleteProfile(ctx, target.id)
-                        pendingDelete = null
-                        scope.launch { reload() }
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                VoiceprintStore.deleteProfile(ctx, target.id)
+                                // 一个人的最后一份档案没了，这个人也就没有存在意义 ——
+                                // 留着会出现「有人但没有声纹」的空壳，F0 兜底还会往它身上标名字
+                                if (siblings <= 1) {
+                                    target.personId?.let { PersonStore.delete(ctx, it) }
+                                }
+                            }
+                            pendingDelete = null
+                            reload()
+                        }
                     },
                 ) {
                     Text("删除", color = VlColor.Red)
@@ -1576,6 +1760,47 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
             },
             dismissButton = {
                 TextButton(onClick = { pendingDelete = null }) {
+                    Text("取消", color = VlColor.Sub)
+                }
+            },
+        )
+    }
+
+    // ---------------------------------------------- 删除整个人（所有麦克风的档案）
+    pendingDeletePerson?.let { target ->
+        val n = profiles.count { it.personId == target.id }
+        AlertDialog(
+            onDismissRequest = { pendingDeletePerson = null },
+            containerColor = VlColor.Surface,
+            title = { Text("删除「${target.name}」？", fontSize = 15.sp, color = VlColor.Text) },
+            text = {
+                Text(
+                    "会一并删掉这个人名下的 $n 份声纹档案（每支麦克风一份）。" +
+                        "已标好的句子不受影响，想恢复只能重新录。",
+                    fontSize = 12.sp,
+                    color = VlColor.Sub,
+                    lineHeight = 18.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                profiles.filter { it.personId == target.id }
+                                    .forEach { VoiceprintStore.deleteProfile(ctx, it.id) }
+                                PersonStore.delete(ctx, target.id)
+                            }
+                            pendingDeletePerson = null
+                            reload()
+                        }
+                    },
+                ) {
+                    Text("删除", color = VlColor.Red)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeletePerson = null }) {
                     Text("取消", color = VlColor.Sub)
                 }
             },
@@ -1902,9 +2127,32 @@ fun SettingsScreen(onEnroll: (String?) -> Unit, onOpenQuality: () -> Unit) {
     }
 }
 
+/**
+ * 性别选择的小块。
+ *
+ * 单独做成「男 / 女 / 不用」三选一，而不是让用户填「男声绑谁、女声绑谁」：
+ * 性别本来就是人的属性，填在档案上就要填 N 次（每支麦一次），
+ * 而且改一次要改 N 处 —— 那正是这次要消灭的问题。
+ */
 @Composable
-private fun SettingsCard(title: String, content: @Composable () -> Unit) {
-    Card(
+private fun GenderChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (selected) VlColor.MeBg else VlColor.SurfaceVar)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+    ) {
+        Text(
+            label,
+            fontSize = 11.sp,
+            color = if (selected) VlColor.MeFg else VlColor.Sub,
+        )
+    }
+}
+
+@Composable
+private fun SettingsCard(title: String, content: @Composable () -> Unit) {    Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = VlColor.Surface),
         shape = RoundedCornerShape(14.dp),

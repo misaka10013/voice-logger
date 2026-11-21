@@ -32,6 +32,7 @@ import com.misaka.voicelog.audio.PitchDetector
 import com.misaka.voicelog.audio.VadSegmenter
 import com.misaka.voicelog.core.AppPrefs
 import com.misaka.voicelog.core.ModelPaths
+import com.misaka.voicelog.core.PersonStore
 import com.misaka.voicelog.core.SyncManager
 import com.misaka.voicelog.core.VoiceprintStore
 import com.misaka.voicelog.data.InterruptEntity
@@ -164,9 +165,30 @@ class CaptureService : Service() {
 
     /** 声纹判定是否启用：需要「模型可用」且「已注册模板」两个条件同时成立 */
     private var spkEnabled = false
-    /** 我的标签名与判定阈值，会话开始时读一次，避免每句都读 SharedPreferences */
-    private var myLabel = "我"
+
+    /** 判定阈值，会话开始时读一次，避免每句都读 SharedPreferences */
     private var spkThreshold = 0.62f
+
+    /**
+     * 「人」的完整列表（见 [PersonStore]）。名字的唯一来源。
+     *
+     * 声纹档案里的人名只是建档快照，显示时必须经 personId 查这里 ——
+     * 否则用户改名后，列表里还是旧名字。
+     */
+    private var persons: List<PersonStore.Person> = emptyList()
+
+    /** 哪几个人是「我」。判定 AUTO_ME 用，不再比名字字符串（改名不该改变统计口径） */
+    private var selfPersonIds: Set<String> = emptySet()
+
+    /**
+     * F0 兜底时唯一男声/女声的人名。null = 该性别不是恰好 1 个人，留未判。
+     *
+     * F0 只能证明「是哪个性别」，证不出「是哪个具体的人」。该性别下站着 2 个人时
+     * 物理上就分不开（2026-11-19 实测女声侧错 42.6%，根因就是那里有两个候选）。
+     * 所以「恰好 1 人才落名字」不是保守，是唯一诚实的选择。
+     */
+    private var maleSoleName: String? = null
+    private var femaleSoleName: String? = null
 
     /** 本轮编码码率。同样在开录时读一次 —— 已落盘的文件不会事后重编码 */
     private var aacBitRate = AacEncoder.BIT_RATE
@@ -183,8 +205,6 @@ class CaptureService : Service() {
     private var f0Enabled = true
     private var f0MaleMax = 160f
     private var f0FemaleMin = 200f
-    private var f0MaleLabel = AppPrefs.DEFAULT_AB_A
-    private var f0FemaleLabel = AppPrefs.DEFAULT_AB_B
 
     /**
      * 本轮实际请求的输入设备 id（0 = 跟随系统默认）。开录时解析一次。
@@ -198,6 +218,23 @@ class CaptureService : Service() {
      * 「界面上是蓝牙麦、数据却来自内置麦」这种静默错误。
      */
     private var targetIsBluetooth = false
+
+    /**
+     * 读一次「声纹 + 人」的全部配置。开录时调，一轮内不再变。
+     *
+     * 为什么要重读两次档案：`ensureMigrated` 会把 personId 写回档案文件头，
+     * 但内存里那份 list 还是迁移前的对象（personId = null），直接拿去 match
+     * 会得到「判出了人却挂不上名字」的结果。重读一次的成本是一次目录扫描（≤8 个文件）。
+     */
+    private fun loadSpeakerConfig() {
+        spkThreshold = VoiceprintStore.threshold(this)
+        PersonStore.ensureMigrated(this, VoiceprintStore.profiles(this))
+        spkProfiles = VoiceprintStore.profiles(this)
+        persons = PersonStore.list(this)
+        selfPersonIds = persons.filter { it.isSelf }.map { it.id }.toSet()
+        maleSoleName = persons.singleOrNull { it.gender == PersonStore.GENDER_MALE }?.name
+        femaleSoleName = persons.singleOrNull { it.gender == PersonStore.GENDER_FEMALE }?.name
+    }
 
     /**
      * 本轮是否因为蓝牙链路建不起来而回落到了手机麦。
@@ -330,16 +367,14 @@ class CaptureService : Service() {
         SessionState.currentSessionId.value = sessionId
 
         // ---- 声纹：模型在 + 至少一个人注册过 才启用，否则整轮跳过判断 ----
-        myLabel = VoiceprintStore.myName(this)
-        spkThreshold = VoiceprintStore.threshold(this)
-        spkProfiles = VoiceprintStore.profiles(this)
+        loadSpeakerConfig()
         aacBitRate = AppPrefs.aacBitRate(this)
         spkEnabled = ModelPaths.spkReady(this) && spkProfiles.isNotEmpty()
         SessionState.voiceprintActive.value = spkEnabled
         Log.d(
             TAG,
             "voiceprint enabled=$spkEnabled profiles=${spkProfiles.map { it.name + "/" + it.sampleCount }} " +
-                "threshold=$spkThreshold self=$myLabel",
+                "threshold=$spkThreshold self=$selfPersonIds persons=${persons.map { it.name + "/" + it.genderLabel }}",
         )
 
         // 重建 VAD / ASR（每次启动都新建，避免上次释放后残留状态）
@@ -498,10 +533,10 @@ class CaptureService : Service() {
             f0Enabled = AppPrefs.f0Enabled(this)
             f0MaleMax = AppPrefs.f0MaleMax(this)
             f0FemaleMin = AppPrefs.f0FemaleMin(this)
-            /* 男女声映射到听标那两个名字，保持单一数据源 ——
-               否则设置里会出现两套「说话人A」输入框，改了一个另一个没变，用户永远搞不清哪个生效。 */
-            f0MaleLabel = AppPrefs.abA(this)
-            f0FemaleLabel = AppPrefs.abB(this)
+            /* 人名与归属走 PersonStore 这一条通道。之前这里读的是听标那两个名字
+               （abA/abB），和声纹档案的名字是两套副本 —— 同一个人被劈成两个 chip
+               就是这么来的。现在名字只存一份，兜底落谁由「该性别是否只有一个人」决定。 */
+            loadSpeakerConfig()
 
             /* ★ 只录不转模式的核心：**不创建任何 ASR / 声纹实例**。
                v2 里这两个模型常驻要占 300MB+ PSS，还要每句推理 135~208ms。
@@ -1352,10 +1387,13 @@ class CaptureService : Service() {
                     val m = VoiceprintStore.match(usableProfiles, emb)
                     score = m?.score ?: 0f
                     if (m != null && score >= spkThreshold) {
-                        // 命中某个具名档案：是本人就标 AUTO_ME，否则标 AUTO_NAMED。
-                        // 两者都对界面显示为"具名"，区别只在于统计时算「我」还是「他人」。
-                        label = m.name
-                        autoTag = if (m.name == myLabel) {
+                        // 命中某个具名档案：名字走 Person，不走档案里的名字快照 ——
+                        // 档案的 name 是建档时写的，用户改名后不会跟着变。
+                        val person = m.personId?.let { pid -> persons.firstOrNull { it.id == pid } }
+                        label = person?.name ?: m.name
+                        // 是本人就标 AUTO_ME，否则标 AUTO_NAMED。判据是 Person.isSelf，
+                        // 不再比名字字符串（改名不该改变统计口径）。
+                        autoTag = if (person?.isSelf == true) {
                             TranscriptEntity.AUTO_ME
                         } else {
                             TranscriptEntity.AUTO_NAMED
@@ -1384,12 +1422,23 @@ class CaptureService : Service() {
                     f0 = hz.toInt()
                     when {
                         hz <= f0MaleMax -> {
-                            label = f0MaleLabel
-                            autoTag = TranscriptEntity.AUTO_NAMED
+                            /* 只在该性别恰好一个人时落名字。0 人 = 还没设性别，
+                               ≥2 人 = 物理上分不开 —— 两种情况都留未判，
+                               而不是像以前那样落一个「我 / 对方」这样的假人。 */
+                            label = maleSoleName
+                            autoTag = if (label != null) {
+                                TranscriptEntity.AUTO_F0_GUESS
+                            } else {
+                                TranscriptEntity.AUTO_UNKNOWN
+                            }
                         }
                         hz >= f0FemaleMin -> {
-                            label = f0FemaleLabel
-                            autoTag = TranscriptEntity.AUTO_NAMED
+                            label = femaleSoleName
+                            autoTag = if (label != null) {
+                                TranscriptEntity.AUTO_F0_GUESS
+                            } else {
+                                TranscriptEntity.AUTO_UNKNOWN
+                            }
                         }
                     }
                 }

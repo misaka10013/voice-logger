@@ -79,6 +79,7 @@ import androidx.compose.ui.unit.sp
 import com.misaka.voicelog.audio.AudioStore
 import com.misaka.voicelog.audio.TranscribeWorker
 import com.misaka.voicelog.core.AppPrefs
+import com.misaka.voicelog.core.PersonStore
 import com.misaka.voicelog.core.PersonTags
 import com.misaka.voicelog.core.ProofreadManager
 import com.misaka.voicelog.core.SpeakerUndo
@@ -468,11 +469,18 @@ fun SessionDetailScreen(
             ?: transcripts.indexOfFirst { it.segmentId > 0L }.takeIf { it >= 0 }
             ?: 0
         val t = transcripts.getOrNull(idx) ?: return
-        /* A/B 名字没填过就用设置里的固定值，不然底部两个按钮是空的、点了也不知道会标成谁 */
-        if (abA.isBlank()) abA = AppPrefs.abA(ctx).ifBlank { meName.ifBlank { "我" } }
+        /* A/B 名字没填过就用设置里的固定值，不然底部两个按钮是空的、点了也不知道会标成谁。
+           已注册声纹时直接给声纹里的名字 —— 用户听到的两个人就是这两个，
+           让他对着「我 / 对方」这种抽象词去点，等于每轮都要在脑子里翻译一次。 */
+        if (abA.isBlank()) {
+            val people = PersonStore.list(ctx)
+            abA = people.firstOrNull { it.isSelf }?.name
+                ?: AppPrefs.abA(ctx).ifBlank { meName.ifBlank { "我" } }
+        }
         if (abB.isBlank() || abB == abA) {
+            val other = PersonStore.list(ctx).firstOrNull { !it.isSelf }?.name
             val b = AppPrefs.abB(ctx)
-            abB = if (b == abA) "对方" else b
+            abB = other ?: if (b == abA) "他人" else b
         }
         listenMode = true
         selectionMode = false
@@ -622,13 +630,17 @@ fun SessionDetailScreen(
                 /* 双人对话一键铺 A/B。放顶栏而不是藏在菜单里，是因为它要
                    在「刚通读完一遍」的时候点，多一层点击就断了节奏。 */
                 TextButton(onClick = {
-                    /* 预填：优先沿用前两行已标的名字；没有就给「我 / 对方」。
-                       用户已标好时点一下确定即可，没标时也不用先去列表里翻两行标人。 */
+                    /* 预填：优先沿用前两行已标的名字；没有就用声纹里注册的那两个人。
+                       都没有才退回「我 / 他人」—— 抽象词只是最后的兜底，
+                       不该是默认值的常态。 */
                     val first = transcripts.firstOrNull()?.speakerName?.takeIf { it.isNotBlank() }
                     val second = transcripts.getOrNull(1)?.speakerName
                         ?.takeIf { it.isNotBlank() && it != first }
-                    abA = first ?: meName.ifBlank { "我" }
-                    abB = second ?: "对方"
+                    val people = PersonStore.list(ctx)
+                    val selfName = people.firstOrNull { it.isSelf }?.name
+                    val otherName = people.firstOrNull { !it.isSelf }?.name
+                    abA = first ?: selfName ?: meName.ifBlank { "我" }
+                    abB = second ?: otherName ?: "他人"
                     abDialog = true
                 }) {
                     Text("A/B", fontSize = 14.sp, color = VlColor.Sub)

@@ -43,12 +43,30 @@ object VoiceprintStore {
          * null = v2 版本留下的旧档案，来源未知，任何场景下都不参与判定。
          */
         val micKey: String? = null,
+
+        /**
+         * 这份档案属于哪个人（见 [PersonStore]）。
+         *
+         * 为什么名字不能只写在这里：一个人通常有多份档案（内置麦一份、蓝牙一份），
+         * 名字写在档案上就是多份副本，改一次名要改 N 处、漏一处就多出一个 chip。
+         * 2026-11-21 的真实故障就是这么来的。现在名字只在 [PersonStore] 存一份，
+         * 档案只记 personId；[name] 退化成「建档时的快照」，仅在 personId 找不到人时兜底显示。
+         *
+         * null = v2/v3 老档案还没迁移，由 [PersonStore.ensureMigrated] 按名字补齐。
+         */
+        val personId: String? = null,
     ) {
         val sampleCount: Int get() = samples.size
     }
 
-    /** 一次判定的结果：最像谁、有多像 */
-    data class Match(val name: String, val score: Float)
+    /**
+     * 一次判定的结果：最像谁、有多像。
+     *
+     * [personId] 非空时，[name] 只是档案里的名字快照，**显示应该用 PersonStore 的名字** ——
+     * 用户改名后快照不会跟着变，直接显示快照就会出现「同一句在列表里叫说话人A、
+     * 在设置里叫新名字」的错位。
+     */
+    data class Match(val name: String, val score: Float, val personId: String? = null)
 
     private const val PREFS = "voiceprint"
     private const val KEY_NAME = "my_label"
@@ -74,8 +92,8 @@ object VoiceprintStore {
 
     /** v2 文件头魔数，和 v1 的 "VLPR" 区分开，避免把旧文件当新格式读 */
     private const val MAGIC = 0x564C5032 // "VLP2"
-    /** v3 起多写一个 micKey；v2 文件仍能读，只是 micKey 记为 null（来源未知） */
-    private const val VERSION = 3
+    /** v3 起多写一个 micKey；v4 起再多写一个 personId。旧版本文件仍能读 */
+    private const val VERSION = 4
     private const val MIN_READ_VERSION = 2
     private const val LEGACY_MAGIC = 0x564C5052 // "VLPR"
 
@@ -103,7 +121,8 @@ object VoiceprintStore {
      * 不应再维护第二份。没有档案时才退回 prefs 里的手填值。
      */
     fun myName(ctx: Context): String =
-        selfProfile(ctx)?.name
+        PersonStore.self(ctx)?.name
+            ?: selfProfile(ctx)?.let { PersonStore.nameOf(ctx, it.personId, it.name) }
             ?: prefs(ctx).getString(KEY_NAME, DEFAULT_NAME)?.takeIf { it.isNotBlank() }
             ?: DEFAULT_NAME
 
@@ -195,6 +214,7 @@ object VoiceprintStore {
         name: String,
         samples: List<FloatArray>,
         micKey: String?,
+        personId: String? = null,
     ) {
         val valid = samples.filter { it.isNotEmpty() }
         if (valid.isEmpty()) return
@@ -206,6 +226,10 @@ object VoiceprintStore {
             /* 空串表示"来源未知"，读回来是 null。不能省略这一行：
                v3 的读取顺序要求它一定存在，省了会把后面的样本数读成字符串长度。 */
             out.writeUTF(micKey ?: "")
+            /* 同上：v4 起这个字段必须写（空串 = 未归属），否则 v4 读取顺序错位。
+               理论上 v3 读 v4 文件会因版本号更小而走 [MIN_READ_VERSION] 之外的分支，
+               但不要指望这个 —— 写满字段是最省的防御。 */
+            out.writeUTF(personId ?: "")
             out.writeInt(valid.size)
             out.writeInt(dim)
             valid.forEach { emb ->
@@ -224,7 +248,7 @@ object VoiceprintStore {
      */
     fun renameProfile(ctx: Context, id: String, newName: String): Boolean {
         val p = profileById(ctx, id) ?: return false
-        saveProfile(ctx, id, newName, p.samples, p.micKey)
+        saveProfile(ctx, id, newName, p.samples, p.micKey, p.personId)
         return true
     }
 
@@ -243,7 +267,20 @@ object VoiceprintStore {
     fun bindMic(ctx: Context, id: String, micKey: String): Boolean {
         val p = profileById(ctx, id) ?: return false
         if (micKey.isBlank() || micKey == KEY_NOT_A_MIC) return false
-        saveProfile(ctx, id, p.name, p.samples, micKey)
+        saveProfile(ctx, id, p.name, p.samples, micKey, p.personId)
+        return true
+    }
+
+    /**
+     * 把档案挂到某个人名下（或改挂）。
+     *
+     * 只重写文件头，样本一字不动 —— 归属是元数据，跟声音特征无关。
+     * 换人不会让相似度变高或变低，只是决定了「这份档案代表谁」。
+     */
+    fun bindPerson(ctx: Context, id: String, personId: String): Boolean {
+        val p = profileById(ctx, id) ?: return false
+        if (personId.isBlank() || p.personId == personId) return false
+        saveProfile(ctx, id, p.name, p.samples, p.micKey, personId)
         return true
     }
 
@@ -266,6 +303,9 @@ object VoiceprintStore {
             dir(ctx).listFiles()?.forEach { it.delete() }
         }
         setSelfId(ctx, null)
+        /* 「人」这一层跟档案是一体的：只清档案不清人，设置页会留下一堆
+           「没有声纹的空壳人」，而 F0 兜底还会继续往他们身上标名字。 */
+        PersonStore.clearAll(ctx)
     }
 
     private fun readProfile(id: String, f: File): Profile? = runCatching {
@@ -276,10 +316,12 @@ object VoiceprintStore {
             val name = inp.readUTF()
             // v2 没有 micKey 字段：旧档案一律视为「来源未知」，不参与任何判定
             val micKey = if (ver >= 3) inp.readUTF().takeIf { it.isNotBlank() } else null
+            // v4 起有 personId。v2/v3 读成 null，交给 PersonStore.ensureMigrated 按名字补
+            val personId = if (ver >= 4) inp.readUTF().takeIf { it.isNotBlank() } else null
             val count = inp.readInt()
             val dim = inp.readInt()
             if (count <= 0 || dim <= 0 || count > 64 || dim > 4096) return null
-            Profile(id, name, List(count) { FloatArray(dim) { inp.readFloat() } }, micKey)
+            Profile(id, name, List(count) { FloatArray(dim) { inp.readFloat() } }, micKey, personId)
         }
     }.getOrNull()
 
@@ -367,17 +409,17 @@ object VoiceprintStore {
      * 是单选问题。把第二第三名也暴露出去只会让界面变复杂，对决策没帮助。
      */
     fun match(profiles: List<Profile>, embedding: FloatArray): Match? {
-        var bestName: String? = null
+        var best: Profile? = null
         var bestScore = 0f
         for (p in profiles) {
             val s = bestScore(p.samples, embedding)
             if (s > bestScore) {
                 bestScore = s
-                bestName = p.name
+                best = p
             }
         }
-        val n = bestName ?: return null
-        return Match(n, bestScore)
+        val n = best ?: return null
+        return Match(n.name, bestScore, n.personId)
     }
 
     /**
