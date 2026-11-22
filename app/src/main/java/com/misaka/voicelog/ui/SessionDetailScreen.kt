@@ -1533,7 +1533,7 @@ fun SessionDetailScreen(
 
     // ------------------------------------------------ 批量标注 Dialog
     if (bulkSpeaker) {
-        /* 多选后常常就是想「这批机器猜的都对」，所以批量也要支持确认。
+        /* 多选后最常见的诉求就是「这一批都算 X」，所以批量也走同一个弹窗。
            只在选中句名字全一致时才认 current：混杂时传空，
            否则弹窗会写着「当前标的是 X」而选中里其实还有别的名字。 */
         val bulkCurrent = selected
@@ -1568,14 +1568,13 @@ fun SessionDetailScreen(
        比打开整个编辑弹窗少一次点击、不遮住上下文；改文字已经在行内做了，
        所以右下角这个入口唯一的职责就是「这行是谁说的」。 */
     speakerTarget?.let { target ->
-        /* 机器猜的依据：音高落在男声区间（≤160Hz）实测改判率约 3.7%，
-           偏高音区间（≥200Hz）约 41% —— 把区间说出来，用户才有判断依据，
-           否则「B?」只是个无法验证的标签。 */
+        /* 音高依据要说出来：落在男声区间（≤160Hz）实测改判率约 3.7%，
+           偏高音区间（≥200Hz）约 41%。这不是要求用户确认，只是给回查留个抓手。 */
         val guessNote = if (target.effectiveAuto == TranscriptEntity.AUTO_F0_GUESS) {
             when {
-                target.f0Hz <= 0 -> "机器猜的，没有音高数据作依据"
-                target.f0Hz <= 160 -> "机器按音高猜的 ${target.f0Hz}Hz，男声区间，通常准"
-                else -> "机器按音高猜的 ${target.f0Hz}Hz，偏高音区间，容易错"
+                target.f0Hz <= 0 -> "按上下文推的，没有音高数据"
+                target.f0Hz <= 160 -> "音高 ${target.f0Hz}Hz，男声区间"
+                else -> "音高 ${target.f0Hz}Hz，偏高音区间，这里容易有误差"
             }
         } else null
         SpeakerPickerDialog(
@@ -1587,15 +1586,15 @@ fun SessionDetailScreen(
             guessNote = guessNote,
             onDismiss = { speakerTarget = null },
             onPick = { name ->
-                /* 确认（选了同名）时这句会立刻掉出「机器猜」筛选、
-                   从当前列表里消失 —— 不给一句提示，会像被误删。 */
+                /* 选了同名时这句会掉出「音高推测」筛选、从当前列表里消失 ——
+                   那是筛选条件变了，不是句子被删了，得给一句提示。 */
                 val confirming = name != null && name == target.speakerName &&
                     target.effectiveAuto == TranscriptEntity.AUTO_F0_GUESS
                 scope.launch {
                     withContext(Dispatchers.IO) {
                         /* 走 applySpeakerEdit：它把 speakerAuto 留作快照、只置 speakerEdited，
                            改判率才算得出来（旧注释说的「要清 auto」已于 2026-11-16 作废）。
-                           同名时它会走「确认」分支，把机器猜转成人工确认。 */
+                           同名时它会走「核对」分支，把推测记成人工核过。 */
                         db.applySpeakerEdit(listOf(target.id), name)
                         rememberName(ctx, name, meName)
                     }
@@ -2126,19 +2125,15 @@ private fun TranscriptRow(
                     }
                 }
                 Spacer(Modifier.height(4.dp))
-                /* 声纹没跑、名字是 F0 猜的句子，标签降透明度并加「?」。
-                   实测 3699 句：声纹命中 2263 句改判 27 句（1.2%），F0 猜 757 句改判 193 句（25.5%）。
-                   两者原本同一套配色，怀疑某句话判错时根本无从下手；
-                   标出来之后，复核只需要点筛选条的「机器猜」。 */
-                val guessed = t.effectiveAuto == TranscriptEntity.AUTO_F0_GUESS
+                /* 名字就是名字，不因为「怎么来的」打折显示。
+                   2026-11-22 用户否掉了「加问号 + 半透明」这套做法：一轮 1487 句里
+                   1196 句带问号，等于甩给他 1196 个待办，而真正判不出、必须人来的
+                   只有 217 句。要复核音高依据的，从筛选条「音高推测」进。 */
                 Box(
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(4.dp))
-                        .background(
-                            speakerBg(t.speakerName, t.effectiveAuto, meName)
-                                .copy(alpha = if (guessed) 0.45f else 1f),
-                        )
+                        .background(speakerBg(t.speakerName, t.effectiveAuto, meName))
                         .combinedClickable(
                             enabled = !selectionMode,
                             onClick = onSpeaker,
@@ -2147,12 +2142,11 @@ private fun TranscriptRow(
                         .padding(horizontal = 3.dp, vertical = 3.dp),
                 ) {
                     Text(
-                        text = (t.speakerName ?: "未判") + if (guessed) "?" else "",
+                        text = t.speakerName ?: "未判",
                         fontSize = 10.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        color = speakerFg(t.speakerName, t.effectiveAuto, meName)
-                            .copy(alpha = if (guessed) 0.85f else 1f),
+                        color = speakerFg(t.speakerName, t.effectiveAuto, meName),
                     )
                 }
             }
@@ -2514,12 +2508,11 @@ private fun SpeakerPickerDialog(
     meName: String,
     knownSpeakers: List<String>,
     tags: List<String>,
-    /* 这行当前已标的说话人。非空时「点同一个名字」＝确认，而不是「没变化」。
-       机器猜出来的名字也写在 speakerName 上，所以不给这一层，用户就只能改判、
-       没法确认 —— 那一整批「名字?」会永远挂着问号。 */
+    /* 这行当前已标的说话人。非空时「点同一个名字」＝口头确认，
+       不等于「没变化」—— 批量标注会用它把选中句统一成一个人。 */
     current: String? = null,
-    /* 当前名字是机器猜的时，把猜的依据（音高）一并说出来：
-       不给依据的话，「A?」和「A」在用户眼里没有信息差，确认也无从判断。 */
+    /* 这个名字是按音高推出来的时，把依据一并说出来：没有依据的推测
+       和「确定」在用户眼里没有差别，想核查也无从下手。 */
     guessNote: String? = null,
     onDismiss: () -> Unit,
     onPick: (String?) -> Unit,
@@ -2541,8 +2534,7 @@ private fun SpeakerPickerDialog(
             Column {
                 if (current != null) {
                     Text(
-                        "当前标的是「$current」" + (guessNote?.let { "（$it）" } ?: "") +
-                            "。点同一个名字＝确认这条判断，点别的＝改判",
+                        "当前标的是「$current」" + (guessNote?.let { "（$it）" } ?: ""),
                         fontSize = 11.sp,
                         color = VlColor.Dim,
                         lineHeight = 16.sp,
@@ -2562,7 +2554,7 @@ private fun SpeakerPickerDialog(
                             onClick = { onPick(opt) },
                             label = {
                                 Text(
-                                    if (isCurrent) "$opt · 确认" else opt,
+                                    if (isCurrent) "$opt · 当前" else opt,
                                     fontSize = 12.sp,
                                 )
                             },
@@ -2676,8 +2668,8 @@ private enum class RowFilter(val label: String) {
     PROOF("AI 建议"),
     UNLABELED("未判"),
 
-    /** 名字是 F0 猜的，声纹没跑（或跑不出结果）。实测这一档错 25.5%，最该先复核 */
-    GUESSED("机器猜"),
+    /** 名字是按音高推出来的（声纹没跑出结果）。只作为回查入口，不是待办队列 */
+    GUESSED("音高推测"),
     NOISE("噪音"),
 }
 

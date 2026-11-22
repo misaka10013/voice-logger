@@ -1187,8 +1187,8 @@ suspend fun VoiceLogDatabase.applyTextEdit(
  *
  * **同值不等于无事可做**：F0 兜底猜出来的名字本身就写在 `speakerName` 上，
  * 用户点标签选「就是这个名字」时，传进来的 name 与旧值相同 —— 若在这里直接跳过，
- * `speakerEdited` 永远置不上，「?」标记永远消不掉，这句也就永远留在「机器猜」筛选里。
- * 所以同值分支要先判是不是「机器猜待确认」：是则转成人工确认（不记账、不算改判），
+ * `speakerEdited` 永远置不上，这行也就永远留在「音高推测」筛选里。
+ * 所以同值分支要先判是不是「音高推测待核对」：是则转成人工核对（不记账、不算改判），
  * 否则才真的跳过。
  */
 suspend fun VoiceLogDatabase.applySpeakerEdit(
